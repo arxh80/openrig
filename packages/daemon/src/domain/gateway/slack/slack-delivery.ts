@@ -585,8 +585,24 @@ function splitIntoParts(opts: SubsystemSlackDeliveryOpts, q: DeliveryPart, decis
  * existing attempted/delivered stores and marker reconciler own each stable part.
  * Preflight ALL parts before posting; the episode receipt is written only after
  * every required part. A restart retries missing parts and the final receipt. */
-export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): SubsystemDeliverFn {
-  return async (decision) => {
+/** Whether an earlier attempt of this exact decision may already be in Slack, answered without posting anything:
+ *  `unattempted` (never tried, or nothing of it recorded), or the reconciler's own verdict on its first message. A gate
+ *  that would hold, trim or ack a decision asks this first, so a post that landed but lost its response is reconciled
+ *  rather than sent again in another form. */
+export async function deliveryLanding(opts: SubsystemSlackDeliveryOpts, decision: OutboundDecision):
+  Promise<"unattempted" | "found" | "maybe" | "absent" | { unreadable: string }> {
+  if (opts.delivered.load().has(decision.decisionId)) return "found";
+  const attempted = opts.attempted.load();
+  const multipart = `${decision.decisionId}:part:1`;
+  const firstId = attempted.has(decision.decisionId) ? decision.decisionId : attempted.has(multipart) ? multipart : null;
+  if (!firstId) return "unattempted";
+  return firstMessageMayHaveLanded(opts, (decision.payload ?? {}) as DeliveryPart, decision.decisionId, firstId);
+}
+
+export type SubsystemSlackDeliverFn = SubsystemDeliverFn & { landing: (decision: OutboundDecision) => ReturnType<typeof deliveryLanding> };
+
+export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): SubsystemSlackDeliverFn {
+  const fn: SubsystemDeliverFn = async (decision) => {
     if (opts.delivered.load().has(decision.decisionId)) return { ok: true };
     const q = (decision.payload ?? {}) as DeliveryPart;
     let parts: DeliveryPart[] = q.humanDetail
@@ -715,4 +731,5 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
       return { ok: false, class: "receipt-failed", detail: (error as Error).message };
     }
   };
+  return Object.assign(fn, { landing: (decision: OutboundDecision) => deliveryLanding(opts, decision) });
 }

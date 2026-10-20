@@ -309,6 +309,7 @@ describe("after QA: changed circumstances and a second person", () => {
   const posts: Array<Record<string, unknown>> = [];
   const wires: Array<ReturnType<typeof buildSlackGatewayWire>> = [];
   let failPosts = false;
+  let loseResponses = false; // the post lands in Slack, but its response never reaches the gateway
   let registryOk = true;
   const person = (id: string) => ({
     entityId: id, class: "human" as const, displayName: id, address: `${id}@external`,
@@ -326,6 +327,7 @@ describe("after QA: changed circumstances and a second person", () => {
     quiet = new HumanQuietStore(db);
     posts.length = 0;
     failPosts = false;
+    loseResponses = false;
     registryOk = true;
     const secrets = join(home, "slack.env");
     writeFileSync(secrets, "SLACK_BOT_TOKEN=xoxb-EXAMPLE-fake\n", { mode: 0o600 });
@@ -340,9 +342,12 @@ describe("after QA: changed circumstances and a second person", () => {
         if (String(url).includes("chat.postMessage")) {
           if (failPosts) throw new Error("connector down before the post");
           posts.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+          if (loseResponses) throw new Error("response lost after the post landed (test)");
           return new Response(JSON.stringify({ ok: true, ts: `1724.${100 + posts.length}` }), { status: 200, headers: { "content-type": "application/json" } });
         }
-        return new Response(JSON.stringify({ ok: true, messages: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        // Channel history for the reconciler's marker scan: what actually landed.
+        const messages = posts.map((post, i) => ({ ts: `1724.${101 + i}`, text: String(post.text ?? "") }));
+        return new Response(JSON.stringify({ ok: true, messages }), { status: 200, headers: { "content-type": "application/json" } });
       },
     });
     w.startServices?.();
@@ -556,6 +561,96 @@ describe("after QA: changed circumstances and a second person", () => {
       registry: { loadHumanRegistry: registry as never }, dispatch: (op, ref, payload, opts) => second.dispatcher.dispatch(op, ref, payload, opts as never) });
     await settle();
     expect(posts.map((p) => JSON.stringify(p)).filter((p) => p.includes(String(routine.body)))).toHaveLength(1);
+  });
+
+  it("review 4 (a): a digest that landed but lost its response, replayed into quiet, is reconciled, not held and posted again", async () => {
+    const row = await ask();
+    const alert = await alertFor(row);
+    repo.update({ qitemId: row.qitemId, actorSession: "daemon@kernel", transitionNote: `delivery-decision: digest window=4h notification_key=${alert.notificationKey}` });
+    const first = wire();
+    loseResponses = true;
+    await runDeliveryDigestFlush({ queueRepo: repo, registry: { loadHumanRegistry: registry as never }, home, window: "4h",
+      dispatch: (op, ref, payload, opts) => first.dispatcher.dispatch(op, ref, payload, opts as never) });
+    await settle();
+    expect(posts).toHaveLength(1); // it landed
+    expect(notes(row).some((n) => n.startsWith("slack-owner-notification-posted "))).toBe(false); // but nobody knows
+    quietOn();
+    first.stop();
+    loseResponses = false;
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true, loadHumanRegistry: registry as never });
+    wire(); // restart during quiet: the replay
+    await settle();
+    expect(notes(row).filter((n) => n.startsWith("slack-owner-notification-posted "))).toHaveLength(1); // reconciled
+    expect(notes(row).some((n) => n.startsWith("delivery-decision: quiet-hold "))).toBe(false);
+    quiet.end("person", { endedBy: "t", now: new Date() });
+    for (const job of releaseJobs()) {
+      await runQuietRelease({ queueRepo: repo, jobsRepo: new WatchdogJobsRepository(db), home, jobId: job.jobId,
+        registry: { loadHumanRegistry: registry as never }, dispatch: (op, ref, payload, opts) => wires.at(-1)!.dispatcher.dispatch(op, ref, payload, opts as never) });
+    }
+    await settle();
+    expect(posts).toHaveLength(1); // exactly one message, ever
+  });
+
+  // An aggregate digest of two members, dispatched as the flush would: A is routine, B has since become an escalation.
+  async function aggregateOf(w: ReturnType<typeof wire>) {
+    const a = await ask();
+    const b = await ask({ tags: ["escalation"] });
+    const member = async (row: QueueItem) => ({ qitemId: row.qitemId, notificationKey: (await alertFor(row)).notificationKey!, level: "NOTICE", kind: "human-required" });
+    const memberReceipts = [await member(a), await member(b)];
+    w.dispatcher.dispatch(OUTBOUND_OP, "person@external", {
+      deliveryDigestPost: true, digestId: "agg", qitemId: a.qitemId, destinationSession: "person@external",
+      summary: "Delivery digest (4h) — 2 item(s)", body: `• ${a.summary} [${a.qitemId}]\n• ${b.summary} [${b.qitemId}]`, memberReceipts,
+    }, { decisionId: "digest:agg-test" } as never);
+    return { a, b };
+  }
+  const receiptKeys = (row: QueueItem) => notes(row).filter((n) => n.startsWith("slack-owner-notification-posted "))
+    .map((n) => n.split(/\s+/).find((t) => t.startsWith("notification_key="))!);
+
+  it("review 4 (b): a trimmed digest's receipts bind to exactly the members posted under its id", async () => {
+    quietOn();
+    const first = wire();
+    loseResponses = true;
+    const { a, b } = await aggregateOf(first);
+    await settle();
+    expect(posts).toHaveLength(1); // the escalation went out under a new id, during quiet; its response was lost
+    expect(JSON.stringify(posts[0])).not.toContain(String(a.summary));
+    quiet.end("person", { endedBy: "t", now: new Date() });
+    first.stop();
+    loseResponses = false;
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true, loadHumanRegistry: registry as never });
+    const second = wire(); // the replay after quiet: reconciles what landed
+    await settle();
+    expect(receiptKeys(b)).toHaveLength(1);
+    expect(receiptKeys(a), "A was never posted, so it has no receipt").toHaveLength(0);
+    for (const job of releaseJobs()) {
+      await runQuietRelease({ queueRepo: repo, jobsRepo: new WatchdogJobsRepository(db), home, jobId: job.jobId,
+        registry: { loadHumanRegistry: registry as never }, dispatch: (op, ref, payload, opts) => second.dispatcher.dispatch(op, ref, payload, opts as never) });
+    }
+    await settle();
+    expect(receiptKeys(a)).toHaveLength(1); // A posted exactly once, by its release
+    expect(posts.filter((p) => JSON.stringify(p).includes(String(a.body)))).toHaveLength(1);
+  });
+
+  it("review 4 (c): a trimmed digest post that fails, then the release, then a replay with quiet off: no second A", async () => {
+    quietOn();
+    const first = wire();
+    failPosts = true;
+    const { a } = await aggregateOf(first);
+    await settle();
+    expect(posts).toHaveLength(0);
+    quiet.end("person", { endedBy: "t", now: new Date() });
+    failPosts = false;
+    for (const job of releaseJobs()) {
+      await runQuietRelease({ queueRepo: repo, jobsRepo: new WatchdogJobsRepository(db), home, jobId: job.jobId,
+        registry: { loadHumanRegistry: registry as never }, dispatch: (op, ref, payload, opts) => first.dispatcher.dispatch(op, ref, payload, opts as never) });
+    }
+    await settle();
+    first.stop();
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true, loadHumanRegistry: registry as never });
+    wire(); // replay with quiet off
+    await settle();
+    const aLines = posts.filter((p) => JSON.stringify(p).includes(String(a.summary)));
+    expect(aLines, "A appears once: its release").toHaveLength(1);
   });
 
   it("the digest flush holds a pre-quiet ask for a quiet second person, under that person's window", async () => {

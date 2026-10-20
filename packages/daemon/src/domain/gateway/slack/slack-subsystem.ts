@@ -453,6 +453,8 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
 
   // Late-bound so deliver can release the driver's in-flight guard (built after the wire).
   let releaseRef: (qitemId: string) => void = () => {};
+  // The wire's own dispatcher, bound once the wire exists: a delivery step that must mint a new durable decision.
+  let selfDispatch: (decisionId: string, payload: unknown) => { ok: boolean; error?: string } = () => ({ ok: false, error: "wire not built" });
 
   const deliver = outboundReady
     ? subsystemSlackDeliver({
@@ -663,11 +665,32 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     outboundSeen.mark(key, "dropped-row-not-active");
     releaseRef(key);
   };
-  // A digest post was decided before it was posted. If its recipient's quiet hours began in between (a buffered post
-  // replayed after a restart, say), its routine members are held for quiet now, under that window, rather than posted
-  // into it; a member that has since become an escalation still posts. If the quiet state can't be read, nothing posts:
-  // the members keep their digest notes, so the next flush selects them again.
+  // An earlier attempt of this exact decision may be in Slack with its response lost. A gate that would hold, trim, defer
+  // or ack it (instead of handing it to delivery) resolves that first, through the reconciler: found (or a scan that
+  // couldn't finish) goes to delivery unchanged, which records receipts for what was posted and never posts it again in
+  // another form; a scan that can't be read retains the decision; never-attempted and absent attempts go on through the
+  // gate. A decision that goes straight to delivery skips this: delivery reconciles it itself, once.
+  const resolveEarlierAttempt = async (decision: Parameters<SubsystemDeliverFn>[0]) => {
+    const landing = "landing" in deliver ? await (deliver as { landing: (d: typeof decision) => Promise<unknown> }).landing(decision) : "unattempted";
+    if (landing === "found" || landing === "maybe") return deliver(decision);
+    if (typeof landing === "object" && landing !== null) {
+      return { ok: false as const, class: "reconcile-unreadable", detail: (landing as { unreadable: string }).unreadable };
+    }
+    return null;
+  };
+
+  // A digest post was decided before it was posted. By the time it is delivered (a buffered post replayed after a
+  // restart, say), some members may already be owned elsewhere: posted (a receipt), or held for quiet hours (a hold
+  // note, so the window's release job posts it). And if the recipient's quiet hours began in between, its routine
+  // members are held now rather than posted into them; a member that has since become an escalation still posts.
+  // The original decision only ever carries its original payload: if what's left differs, it goes out as a new
+  // decision with its own id and receipts (enqueued before the original is acked), so a post under one id never has two
+  // contents, and receipts bind to exactly the members posted under it. An earlier attempt of the original that may
+  // have landed is resolved by the reconciler first. If the quiet state can't be read, nothing posts: the members keep
+  // their digest notes, so the next flush selects them again.
   const deliverDigestPost = async (decision: Parameters<SubsystemDeliverFn>[0], p: OutboundPostPayload) => {
+    const settled = await resolveEarlierAttempt(decision);
+    if (settled) return settled;
     const recipient = (p.destinationSession ?? "").split("@")[0] ?? "";
     let quiet: ReturnType<typeof quietHoldFor>;
     try {
@@ -676,22 +699,31 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       log(`digest post ${decision.decisionId} not posted: quiet hours couldn't be read: ${(error as Error).message}`);
       return { ok: true as const };
     }
-    if (!quiet) return deliver(decision);
     const aggregate = (p as { memberReceipts?: Array<{ qitemId: string; notificationKey: string }> }).memberReceipts;
     const members = aggregate ?? (p.qitemId ? [{ qitemId: p.qitemId, notificationKey: p.notificationKey ?? p.qitemId }] : []);
+    const owned = (m: { qitemId: string; notificationKey: string }) =>
+      opts.queueRepo.transitionLog.hasOwnerNotificationReceipt(m.qitemId, m.notificationKey)
+      || opts.queueRepo.listTransitions(m.qitemId).some((t) => (t.transitionNote ?? "").startsWith("delivery-decision: quiet-hold ")
+        && (t.transitionNote ?? "").split(/\s+/).includes(`notification_key=${m.notificationKey}`));
     const jobsRepo = new WatchdogJobsRepository(opts.queueRepo.db);
     const kept = members.filter((m) => {
+      if (owned(m)) return false;
+      if (!quiet) return true;
       const row = opts.queueRepo.getById(m.qitemId);
       if (row && row.humanIntent !== "update" && isEscalationClass(row.tags)) return true;
       holdForQuiet({ queueRepo: opts.queueRepo, jobsRepo, qitemId: m.qitemId, entityId: recipient, hold: { ...quiet!, notificationKey: m.notificationKey } });
       return false;
     });
-    if (kept.length === 0) return { ok: true as const };
-    if (!aggregate || kept.length === aggregate.length) return deliver(decision);
+    if (kept.length === members.length) return deliver(decision); // unchanged: the original, as it is
+    if (kept.length === 0 || !aggregate) return { ok: true as const }; // nothing left to post under it
     const keptIds = new Set(kept.map((m) => m.qitemId));
     const body = String(p.body ?? "").split("\n").filter((line) => [...keptIds].some((id) => line.endsWith(`[${id}]`))).join("\n");
     const summary = String(p.summary ?? "").replace(/— \d+ item\(s\)/, `— ${kept.length} item(s)`);
-    return deliver({ ...decision, payload: { ...p, memberReceipts: kept, body, summary } } as typeof decision);
+    const keptId = `${decision.decisionId}:kept:${createHash("sha256").update(kept.map((m) => m.notificationKey).sort().join(",")).digest("hex").slice(0, 16)}`;
+    // Durable first: the new decision is in the buffer before the original is acked (returning ok). A crash between the
+    // two replays the original, which computes the same kept set and id; the dispatcher accepts the pending id once.
+    const res = selfDispatch(keptId, { ...p, memberReceipts: kept, body, summary });
+    return res.ok ? { ok: true as const } : { ok: false as const, class: "kept-dispatch-refused", detail: res.error };
   };
 
   const engineDeliver: SubsystemDeliverFn = async (decision) => {
@@ -721,6 +753,8 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
         releaseRef(p.qitemId);
         return { ok: true as const };
       }
+      const settled = await resolveEarlierAttempt(decision);
+      if (settled) return settled;
       const verdict = !p.qitemId ? "post" : await confirmReleaseAtPost({
         queueRepo: opts.queueRepo,
         jobsRepo: new WatchdogJobsRepository(opts.queueRepo.db),
@@ -755,6 +789,11 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       // Released by notification key, the guard's own key: nothing marks this ask seen, so the next sweep must see it.
       releaseRef(p.notificationKey ?? p.qitemId!);
       return { ok: true as const };
+    }
+    if (ruled && (ruled.outcome === "log" || (ruled.outcome === "hold" && ruled.quietHold)
+      || ruled.outcome === "digest" || ruled.deferMinutes !== undefined)) {
+      const settled = await resolveEarlierAttempt(decision);
+      if (settled) return settled;
     }
     if (ruled) {
       recordTerminationOnce(p, ruled);
@@ -823,6 +862,8 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     deliver: outboundReady ? engineDeliver : deliver,
     log,
   });
+  selfDispatch = (decisionId, payload) =>
+    wire.dispatcher.dispatch(OUTBOUND_OP, String((payload as { destinationSession?: string }).destinationSession ?? ""), payload, { decisionId });
 
   // Services are CONSTRUCTED here but started only via startServices() (post-bind, index.ts):
   // composing a daemon must never dial Slack or start pollers — the createDaemon-in-tests
