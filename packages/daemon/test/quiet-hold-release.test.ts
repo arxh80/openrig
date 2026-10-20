@@ -3,7 +3,7 @@
 // each still-eligible ask individually through the ordinary Slack path. Real SQLite (all migrations), the real queue,
 // the real gateway wire over a recording fetch, and the real watchdog jobs table. No Slack. Native: NOT RUN.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
@@ -571,7 +571,8 @@ describe("after review: the outbound sweep when a dispatch throws", () => {
     expect(second.dispatched).toEqual(["q-1"]);
   });
 
-  it.each(["unreadable", "corrupt"])("a dispatch that throws while the buffer is %s stays in flight: can't tell is never 'nothing pending'", async (state) => {
+  // Faults that fail for every user, root included (permission bits don't stop root), and are never ENOENT.
+  it.each(["a directory in its place", "corrupt"])("a dispatch that throws while the buffer file is %s stays in flight: can't tell is never 'nothing pending'", async (state) => {
     const buffer = new DispatchBuffer(home);
     buffer.enqueue({ kind: "outbound_decision", decisionId: "d-before", op: OUTBOUND_OP, entityBindingRef: "person@external", payload: alerts[0] });
     const path = dispatchBufferPath(home);
@@ -581,7 +582,8 @@ describe("after review: the outbound sweep when a dispatch throws", () => {
       home, queue: { listHumanAlerts: async () => [alerts[0]] } as never, seen: new SeenStore(join(home, "seen.jsonl")), filter: { minimumLevel: "NOTICE" } as never,
       dispatch: () => { calls++; throw new Error("transport state unavailable (test)"); }, log: () => {},
     });
-    if (state === "unreadable") chmodSync(path, 0o000); else writeFileSync(path, "{ not json");
+    if (state === "corrupt") writeFileSync(path, "{ not json");
+    else { rmSync(path); mkdirSync(path); } // the read throws EISDIR
     try {
       const first = await driver.sweepOnce();
       const second = await driver.sweepOnce();
@@ -589,12 +591,13 @@ describe("after review: the outbound sweep when a dispatch throws", () => {
       expect(second.fresh, "the key stays in flight rather than risk a second decision").toBe(0);
       expect(calls).toBe(1);
     } finally {
-      if (state === "unreadable") chmodSync(path, 0o600); else writeFileSync(path, before);
+      if (state !== "corrupt") rmSync(path, { recursive: true, force: true });
+      writeFileSync(path, before);
     }
     expect(buffer.pending().map((d) => d.decisionId)).toEqual(["d-before"]);
   });
 
-  it("a stored decision behind a directory that can't be searched isn't 'no file': the strict read throws and the ask stays in flight", async () => {
+  it("a stored decision whose directory is replaced by a file isn't 'no file': the strict read throws and the ask stays in flight", async () => {
     const buffer = new DispatchBuffer(home);
     buffer.enqueue({ kind: "outbound_decision", decisionId: "d-parent", op: OUTBOUND_OP, entityBindingRef: "person@external", payload: alerts[0] });
     const path = dispatchBufferPath(home);
@@ -605,7 +608,8 @@ describe("after review: the outbound sweep when a dispatch throws", () => {
       home, queue: { listHumanAlerts: async () => [alerts[0]] } as never, seen: new SeenStore(join(home, "seen.jsonl")), filter: { minimumLevel: "NOTICE" } as never,
       dispatch: () => { calls++; throw new Error("transport state unavailable (test)"); }, log: () => {},
     });
-    chmodSync(parent, 0o000);
+    renameSync(parent, `${parent}.aside`);
+    writeFileSync(parent, "not a directory"); // the read throws ENOTDIR
     try {
       expect(() => buffer.pendingStrict()).toThrow();
       await driver.sweepOnce();
@@ -613,14 +617,17 @@ describe("after review: the outbound sweep when a dispatch throws", () => {
       expect(second.fresh).toBe(0);
       expect(calls).toBe(1);
     } finally {
-      chmodSync(parent, 0o700);
+      rmSync(parent, { force: true });
+      renameSync(`${parent}.aside`, parent);
     }
     expect(readFileSync(path, "utf8")).toBe(before);
     expect(buffer.pending().map((d) => d.decisionId)).toEqual(["d-parent"]);
   });
 
-  it("a buffer file that doesn't exist yet is still 'nothing pending' to the strict read", () => {
-    expect(new DispatchBuffer(home).pendingStrict()).toEqual([]);
+  it("a buffer that doesn't exist yet, or whose directory doesn't, is still 'nothing pending' to the strict read", () => {
+    expect(new DispatchBuffer(home).pendingStrict()).toEqual([]); // no gateway directory at all
+    mkdirSync(dirname(dispatchBufferPath(home)), { recursive: true });
+    expect(new DispatchBuffer(home).pendingStrict()).toEqual([]); // the directory, but no file
   });
 
   it("a dispatch that throws after its decision was persisted stays in flight: replay owns it, and no second decision is made", async () => {
