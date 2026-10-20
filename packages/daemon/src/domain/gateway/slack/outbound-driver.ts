@@ -103,12 +103,26 @@ export class SlackOutboundDriver {
       for (const alert of fresh) {
         // Marked in flight BEFORE dispatching: the delivery layer can run synchronously inside dispatch and release the
         // key (a deferred decision does), and that release must win over this mark, or the ask is never offered again.
-        this.inflight.add(notificationKey(alert));
-        const res = this.deps.dispatch(OUTBOUND_OP, alert.destinationSession ?? "(unknown)", toPayload(alert));
+        const key = notificationKey(alert);
+        this.inflight.add(key);
+        let res: DispatchResult;
+        try {
+          res = this.deps.dispatch(OUTBOUND_OP, alert.destinationSession ?? "(unknown)", toPayload(alert));
+        } catch (error) {
+          // A throw after the decision was persisted leaves it pending in the durable buffer, and replay owns it: the key
+          // stays in flight, or the next sweep would make a second decision (a duplicate post). A throw before
+          // persistence left nothing durable: the key is cleared so the next sweep offers the ask again. The catch only
+          // ever clears, so a release the delivery layer already made still stands. Either way, the sweep goes on.
+          if (!this.pendingInBuffer(key)) this.inflight.delete(key);
+          const message = `dispatch threw: ${(error as Error).message}`;
+          refused.push({ qitemId: alert.qitemId, error: message });
+          this.deps.log?.(`outbound dispatch failed for ${alert.qitemId}: ${message}`);
+          continue;
+        }
         if (res.ok) {
           dispatched.push(alert.qitemId);
         } else {
-          this.inflight.delete(notificationKey(alert));
+          this.inflight.delete(key);
           // Refused (e.g. delivery layer unconfigured → op unadvertised): honest, retried next
           // sweep — nothing durable was minted, so this is not a retained decision.
           refused.push({ qitemId: alert.qitemId, error: res.error });
@@ -120,6 +134,19 @@ export class SlackOutboundDriver {
       return result;
     } finally {
       this.sweeping = false;
+    }
+  }
+
+  /** Whether the durable buffer holds a pending decision for this key (the rule start() reseeds by). A buffer that can't
+   *  be read counts as pending: waiting for the restart reseed is better than a duplicate post. */
+  private pendingInBuffer(key: string): boolean {
+    try {
+      return new DispatchBuffer(this.deps.home).pending().some((d) => {
+        const payload = d.payload as OutboundPostPayload | undefined;
+        return (payload?.notificationKey ?? payload?.qitemId) === key;
+      });
+    } catch {
+      return true;
     }
   }
 

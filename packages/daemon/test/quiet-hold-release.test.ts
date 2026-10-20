@@ -18,6 +18,7 @@ import { buildSlackGatewayWire } from "../src/domain/gateway/slack/slack-subsyst
 import { OUTBOUND_OP, toPayload } from "../src/domain/gateway/slack/outbound-driver.js";
 import { DispatchBuffer } from "../src/domain/gateway/dispatch-buffer.js";
 import { SlackOutboundDriver } from "../src/domain/gateway/slack/outbound-driver.js";
+import { SeenStore } from "../src/domain/gateway/slack/state-store.js";
 import { resolveSlackHandle } from "../src/domain/gateway/human-registry.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 import { HumanQuietStore, quietHoldFor } from "../src/domain/gateway/human-quiet-windows.js";
@@ -531,5 +532,62 @@ describe("after QA: changed circumstances and a second person", () => {
     expect(posts).toHaveLength(1);
     expect(notes(row).some((n) => n.startsWith("delivery-decision: quiet-hold"))).toBe(false);
     expect(releaseJobs()).toHaveLength(0);
+  });
+});
+
+// ─── After review: the real outbound sweep when a dispatch throws ───────────────────────────────────────────────────
+
+describe("after review: the outbound sweep when a dispatch throws", () => {
+  let home: string;
+  beforeEach(() => { home = mkdtempSync(join(tmpdir(), "sweep-throw-")); });
+  afterEach(() => { rmSync(home, { recursive: true, force: true }); });
+
+  const alerts = [
+    { qitemId: "q-1", notificationKey: "q-1:11", destinationSession: "person@external", summary: "one" },
+    { qitemId: "q-2", notificationKey: "q-2:12", destinationSession: "person@external", summary: "two" },
+  ];
+  function driverWith(dispatch: (payload: { notificationKey?: string; qitemId: string }) => { ok: true; decisionId: string }) {
+    return new SlackOutboundDriver({
+      home, queue: { listHumanAlerts: async () => alerts } as never, seen: new SeenStore(join(home, "seen.jsonl")), filter: { minimumLevel: "NOTICE" } as never,
+      dispatch: (_op, _ref, payload) => dispatch(payload as { notificationKey?: string; qitemId: string }), log: () => {},
+    });
+  }
+
+  it("a dispatch that throws before anything is persisted is offered again on the next sweep, and the rest of the sweep goes on", async () => {
+    let calls: string[] = [];
+    let failFirst = true;
+    const driver = driverWith((p) => {
+      calls.push(p.qitemId);
+      if (failFirst && p.qitemId === "q-1") throw new Error("descriptor rejected (test)");
+      return { ok: true, decisionId: `d-${p.qitemId}` };
+    });
+    const first = await driver.sweepOnce();
+    expect(calls).toEqual(["q-1", "q-2"]); // the throw on the first alert didn't stop the second
+    expect(first.dispatched).toEqual(["q-2"]);
+    expect(first.refused.map((r) => r.qitemId)).toEqual(["q-1"]);
+    failFirst = false; calls = [];
+    const second = await driver.sweepOnce();
+    expect(calls).toEqual(["q-1"]); // q-1 offered again; q-2 is in flight
+    expect(second.dispatched).toEqual(["q-1"]);
+  });
+
+  it("a dispatch that throws after its decision was persisted stays in flight: replay owns it, and no second decision is made", async () => {
+    let calls = 0;
+    const buffer = new DispatchBuffer(home);
+    const driver = driverWith((p) => {
+      calls++;
+      if (p.qitemId === "q-1") {
+        buffer.enqueue({ kind: "outbound_decision", decisionId: "d-q-1", op: OUTBOUND_OP, entityBindingRef: "person@external", payload: p });
+        throw new Error("send failed after enqueue (test)");
+      }
+      return { ok: true, decisionId: `d-${p.qitemId}` };
+    });
+    await driver.sweepOnce();
+    expect(calls).toBe(2);
+    calls = 0;
+    const second = await driver.sweepOnce();
+    expect(calls).toBe(0);
+    expect(second.fresh).toBe(0);
+    expect(buffer.pending().filter((d) => (d.payload as { qitemId?: string }).qitemId === "q-1")).toHaveLength(1);
   });
 });
