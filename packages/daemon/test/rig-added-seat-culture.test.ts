@@ -201,4 +201,16 @@ describe("a seat added to a running rig gets the rig's culture and startup layer
     expect(f.claudeMd(seatCwd)).toContain(CULTURE_TEXT);
     f.db.close();
   });
+
+  it("a rig with nothing stored (created before this, or declaring neither) keeps today's behaviour: no backfill", async () => {
+    const f = fixture();
+    const rigId = await launched(f);
+    f.rigRepo.setRigStartupLayers(rigId, null);
+    const outcome = await f.inst.addMemberToPod(rigId, "dev",
+      { id: "late", agent_ref: "local:agents/impl", profile: "default", runtime: "claude-code", cwd: f.cwd("late-repo") }, f.otherRoot);
+    expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
+    expect(f.rigFile("dev.late", "CULTURE.md")).toBeUndefined();
+    expect(f.rigFile("dev.late", "RIG-NOTES.md")).toBeUndefined();
+    f.db.close();
+  });
 });

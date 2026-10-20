@@ -121,6 +121,7 @@ import { queueItemWakeInputBoxSchema } from "./migrations/116_queue_item_wake_in
 import { providerAccountReadingsSchema } from "./migrations/117_provider_account_readings.js";
 import { humanQuietWindowsSchema } from "./migrations/118_human_quiet_windows.js";
 import { seatIdentityPanePidSchema } from "./migrations/119_seat_identity_pane_pid.js";
+import { rigStartupLayersSchema } from "./migrations/120_rig_startup_layers.js";
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
 
@@ -241,4 +242,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   providerAccountReadingsSchema,
   humanQuietWindowsSchema,
   seatIdentityPanePidSchema,
+  rigStartupLayersSchema,
 ];

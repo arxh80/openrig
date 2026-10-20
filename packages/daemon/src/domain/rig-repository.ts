@@ -18,7 +18,15 @@ import type {
   Snapshot,
   SnapshotData,
   SessionSourceSpec,
+  StartupBlock,
 } from "./types.js";
+
+/** A rig's own startup layers: its `culture_file` and rig `startup` block as declared, and the absolute root they resolve against. */
+export interface RigStartupLayers {
+  root: string;
+  cultureFile?: string;
+  startup?: StartupBlock;
+}
 
 /**
  * Free helper: returns the latest snapshot for a rig whose data carries non-null
@@ -265,6 +273,27 @@ export class RigRepository {
     if (!this.hasRigColumn("claude_managed_block_file")) return;
     this.db.prepare("UPDATE rigs SET claude_managed_block_file = ?, updated_at = ? WHERE id = ?")
       .run(file ?? null, new Date().toISOString(), rigId);
+  }
+
+  /** The rig's `culture_file` and rig `startup` block as its spec declared them, and the absolute root their paths
+   *  resolve against (migration 120). A seat added to the rig later reads them back. Null when neither was declared. */
+  setRigStartupLayers(rigId: string, layers: RigStartupLayers | null): void {
+    if (!this.hasRigColumn("startup_layers_json")) return;
+    this.db.prepare("UPDATE rigs SET startup_layers_json = ?, updated_at = ? WHERE id = ?")
+      .run(layers ? JSON.stringify(layers) : null, new Date().toISOString(), rigId);
+  }
+
+  getRigStartupLayers(rigId: string): RigStartupLayers | null {
+    if (!this.hasRigColumn("startup_layers_json")) return null;
+    const row = this.db.prepare("SELECT startup_layers_json FROM rigs WHERE id = ?")
+      .get(rigId) as { startup_layers_json: string | null } | undefined;
+    if (!row?.startup_layers_json) return null;
+    try {
+      const parsed = JSON.parse(row.startup_layers_json) as Partial<RigStartupLayers>;
+      return typeof parsed.root === "string" ? parsed as RigStartupLayers : null;
+    } catch {
+      return null;
+    }
   }
 
   /** #25 — the rig's selected Claude managed-block file, or null when it uses the default. */
