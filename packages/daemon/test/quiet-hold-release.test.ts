@@ -4,7 +4,7 @@
 // the real gateway wire over a recording fetch, and the real watchdog jobs table. No Slack. Native: NOT RUN.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
@@ -592,6 +592,35 @@ describe("after review: the outbound sweep when a dispatch throws", () => {
       if (state === "unreadable") chmodSync(path, 0o600); else writeFileSync(path, before);
     }
     expect(buffer.pending().map((d) => d.decisionId)).toEqual(["d-before"]);
+  });
+
+  it("a stored decision behind a directory that can't be searched isn't 'no file': the strict read throws and the ask stays in flight", async () => {
+    const buffer = new DispatchBuffer(home);
+    buffer.enqueue({ kind: "outbound_decision", decisionId: "d-parent", op: OUTBOUND_OP, entityBindingRef: "person@external", payload: alerts[0] });
+    const path = dispatchBufferPath(home);
+    const parent = dirname(path);
+    const before = readFileSync(path, "utf8");
+    let calls = 0;
+    const driver = new SlackOutboundDriver({
+      home, queue: { listHumanAlerts: async () => [alerts[0]] } as never, seen: new SeenStore(join(home, "seen.jsonl")), filter: { minimumLevel: "NOTICE" } as never,
+      dispatch: () => { calls++; throw new Error("transport state unavailable (test)"); }, log: () => {},
+    });
+    chmodSync(parent, 0o000);
+    try {
+      expect(() => buffer.pendingStrict()).toThrow();
+      await driver.sweepOnce();
+      const second = await driver.sweepOnce();
+      expect(second.fresh).toBe(0);
+      expect(calls).toBe(1);
+    } finally {
+      chmodSync(parent, 0o700);
+    }
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(buffer.pending().map((d) => d.decisionId)).toEqual(["d-parent"]);
+  });
+
+  it("a buffer file that doesn't exist yet is still 'nothing pending' to the strict read", () => {
+    expect(new DispatchBuffer(home).pendingStrict()).toEqual([]);
   });
 
   it("a dispatch that throws after its decision was persisted stays in flight: replay owns it, and no second decision is made", async () => {
