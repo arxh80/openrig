@@ -666,13 +666,14 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     releaseRef(key);
   };
   // An earlier attempt of this exact decision may be in Slack with its response lost. A gate that would hold, trim, defer
-  // or ack it (instead of handing it to delivery) resolves that first, through the reconciler: found (or a scan that
-  // couldn't finish) goes to delivery unchanged, which records receipts for what was posted and never posts it again in
-  // another form; a scan that can't be read retains the decision; never-attempted and absent attempts go on through the
-  // gate. A decision that goes straight to delivery skips this: delivery reconciles it itself, once.
+  // or ack it (instead of handing it to delivery) resolves that first, through the reconciler: found goes to delivery
+  // unchanged, which records receipts for what was posted and never posts it again in another form; a scan that can't be
+  // read retains the decision. Never-attempted and absent attempts, and a scan that couldn't finish, go on through the
+  // gate: where it posts, delivery reconciles (keeping its at-least-once post for an unfinished scan); where it holds,
+  // that post waits for the release instead of landing in quiet. A decision that goes straight to delivery skips this.
   const resolveEarlierAttempt = async (decision: Parameters<SubsystemDeliverFn>[0]) => {
     const landing = "landing" in deliver ? await (deliver as { landing: (d: typeof decision) => Promise<unknown> }).landing(decision) : "unattempted";
-    if (landing === "found" || landing === "maybe") return deliver(decision);
+    if (landing === "found") return deliver(decision);
     if (typeof landing === "object" && landing !== null) {
       return { ok: false as const, class: "reconcile-unreadable", detail: (landing as { unreadable: string }).unreadable };
     }
