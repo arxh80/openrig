@@ -70,7 +70,7 @@ export async function runDeliveryDigestFlush(input: RunDeliveryDigestFlushInput)
     }
   } catch { /* unreadable buffer: fail open to selection; the dispatcher's stable-id idempotence still guards the same-set case */ }
 
-  const selected = alerts.filter((alert) => {
+  const candidates = alerts.filter((alert) => {
     const key = alert.notificationKey ?? alert.qitemId;
     if (inFlight.has(key)) return false;
     const notes = input.queueRepo.listTransitions(alert.qitemId).map((t) => t.transitionNote ?? "");
@@ -81,16 +81,19 @@ export async function runDeliveryDigestFlush(input: RunDeliveryDigestFlushInput)
         && n.includes(`notification_key=${key}`)
         && n.includes(`window=${input.window}`));
   });
-  // Quiet hours re-checked at flush time: an ask put in the digest before quiet began is held, not posted, while it's on.
-  const quiet = selected.length ? quietHoldFor(input.queueRepo.db, human.entityId, input.now ?? new Date()) : null;
-  if (quiet) {
-    const jobsRepo = new WatchdogJobsRepository(input.queueRepo.db);
-    for (const item of selected) {
-      holdForQuiet({ queueRepo: input.queueRepo, jobsRepo, qitemId: item.qitemId, entityId: human.entityId,
-        hold: { ...quiet, notificationKey: item.notificationKey ?? item.qitemId } });
-    }
-    return { dispatched: 0, members: 0 };
-  }
+  // Quiet hours re-checked at flush time, per ask, for its actual recipient: an ask put in the digest before its
+  // recipient's quiet began is held under that recipient's window, not posted. Everything else flushes as before.
+  const now = input.now ?? new Date();
+  let jobsRepo: WatchdogJobsRepository | undefined;
+  const selected = candidates.filter((item) => {
+    const recipient = (item.destinationSession ?? "").split("@")[0] ?? "";
+    const quiet = recipient ? quietHoldFor(input.queueRepo.db, recipient, now) : null;
+    if (!quiet) return true;
+    jobsRepo ??= new WatchdogJobsRepository(input.queueRepo.db);
+    holdForQuiet({ queueRepo: input.queueRepo, jobsRepo, qitemId: item.qitemId, entityId: recipient,
+      hold: { ...quiet, notificationKey: item.notificationKey ?? item.qitemId } });
+    return false;
+  });
   if (selected.length === 0) return { dispatched: 0, members: 0 };
   // The selected timing remains the existing digest policy. At that time a
   // human request/update needs its OWN complete brief and reply identity, not a

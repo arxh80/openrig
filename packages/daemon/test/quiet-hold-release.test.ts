@@ -15,7 +15,8 @@ import { QueueRepository, type QueueItem } from "../src/domain/queue-repository.
 import { makeQueuePorts } from "../src/domain/gateway/slack/queue-access.js";
 import { DEFAULT_CONFIG, saveConfig } from "../src/domain/gateway/slack/config.js";
 import { buildSlackGatewayWire } from "../src/domain/gateway/slack/slack-subsystem.js";
-import { OUTBOUND_OP } from "../src/domain/gateway/slack/outbound-driver.js";
+import { OUTBOUND_OP, toPayload } from "../src/domain/gateway/slack/outbound-driver.js";
+import { DispatchBuffer } from "../src/domain/gateway/dispatch-buffer.js";
 import { resolveSlackHandle } from "../src/domain/gateway/human-registry.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 import { HumanQuietStore } from "../src/domain/gateway/human-quiet-windows.js";
@@ -25,6 +26,7 @@ import { formatQuietHoldNote, parseQuietHoldNote, QUIET_RELEASE_POLICY, runQuiet
 import { makeOperatorDeliveryEngine } from "../src/domain/gateway/operator-delivery-engine.js";
 
 const HUMAN = "human-founder";
+const settle = () => new Promise((resolve) => setTimeout(resolve, 60));
 
 function registryWith(prefs: Record<string, unknown>) {
   return {
@@ -291,5 +293,150 @@ describe("holding and releasing through the gateway", () => {
     const out = await engine.dispatchEscalation(row, "test");
     expect(out).toMatchObject({ dispatched: true, decision: "interrupt" });
     expect(dispatched).toHaveLength(1);
+  });
+});
+
+// ─── After QA: a buffered release re-checked at post time, and quiet per actual recipient in the digest flush ──────
+
+describe("after QA: changed circumstances and a second person", () => {
+  let db: Database.Database;
+  let repo: QueueRepository;
+  let home: string;
+  let quiet: HumanQuietStore;
+  let order: string[];
+  const posts: Array<Record<string, unknown>> = [];
+  const wires: Array<ReturnType<typeof buildSlackGatewayWire>> = [];
+  let failPosts = false;
+  const person = (id: string) => ({
+    entityId: id, class: "human" as const, displayName: id, address: `${id}@external`,
+    prefs: id === "person" ? { deliveryClass: "C", availability: "available" } : { deliveryClass: "B", availability: "available" },
+    connectorBindings: [{ kind: "slack" as const, connectorRef: "primary", secretsRef: "env:SLACK_BOT_TOKEN", role: "primary" as const, handle: id === "person" ? "UPERSON" : "UOTHER" }],
+  });
+  const registry = () => ({ ok: true as const, entities: order.map(person) });
+
+  beforeEach(() => {
+    db = createDb();
+    migrate(db, ALL_MIGRATIONS);
+    order = ["person", "other"];
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true, loadHumanRegistry: registry as never });
+    home = mkdtempSync(join(tmpdir(), "quiet-qa-"));
+    quiet = new HumanQuietStore(db);
+    posts.length = 0;
+    failPosts = false;
+    const secrets = join(home, "slack.env");
+    writeFileSync(secrets, "SLACK_BOT_TOKEN=xoxb-EXAMPLE-fake\n", { mode: 0o600 });
+    saveConfig({ ...DEFAULT_CONFIG, enabled: true, channel: "C-OWNER", secretsEnvFile: secrets }, home);
+  });
+  afterEach(() => { for (const w of wires.splice(0)) w.stop(); db.close(); rmSync(home, { recursive: true, force: true }); });
+
+  function wire() {
+    const w = buildSlackGatewayWire({
+      home, queueRepo: repo, registry: { loadHumanRegistry: registry as never, resolveSlackHandle }, outboundIntervalMs: 3_600_000,
+      fetchImpl: async (url, init) => {
+        if (String(url).includes("chat.postMessage")) {
+          if (failPosts) throw new Error("connector down before the post");
+          posts.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+          return new Response(JSON.stringify({ ok: true, ts: `1724.${100 + posts.length}` }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ ok: true, messages: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+    w.startServices?.();
+    wires.push(w);
+    return w;
+  }
+  let n = 0;
+  const ask = (extra: Record<string, unknown> = {}) => repo.create({ sourceSession: "asker@r", destinationSession: "person@external",
+    body: `Full question ${++n}: choose the window`, summary: `Choose ${n}`, evidenceRef: `/proof/${n}.md`, humanIntent: "decision", ...extra, nudge: false } as never) as Promise<QueueItem>;
+  const alertFor = async (row: QueueItem) =>
+    (await makeQueuePorts(repo, { loadHumanRegistry: registry } as never).listHumanAlerts({ minimumLevel: "RECORD" })).find((a) => a.qitemId === row.qitemId)!;
+  const quietOn = () => { const now = new Date(); quiet.setUntil("person", { until: new Date(now.getTime() + 3_600_000), timezone: "UTC", setBy: "t", now }); };
+  const notes = (row: QueueItem) => repo.listTransitions(row.qitemId).map((t) => t.transitionNote ?? "");
+  const releaseJobs = () => new WatchdogJobsRepository(db).listActive().filter((j) => j.policy === QUIET_RELEASE_POLICY);
+
+  it.each(["quiet back on", "posting threshold raised", "recipient changed"])(
+    "a release dispatched but not yet posted is re-checked when it's replayed: %s posts nothing", async (change) => {
+      quietOn();
+      const row = await ask(change === "posting threshold raised" ? { humanIntent: "update" } : {});
+      const first = wire();
+      const alert = await alertFor(row);
+      first.dispatcher.dispatch(OUTBOUND_OP, alert.destinationSession!, toPayload(alert));
+      await settle();
+      expect(posts).toHaveLength(0);
+      quiet.end("person", { endedBy: "t", now: new Date() });
+      // The release is dispatched while the connector is down: it waits in the durable buffer.
+      const buffer = new DispatchBuffer(home);
+      const [job] = releaseJobs();
+      const released = await runQuietRelease({ queueRepo: repo, jobsRepo: new WatchdogJobsRepository(db), home, jobId: job!.jobId,
+        registry: { loadHumanRegistry: registry as never },
+        dispatch: (op, ref, payload, opts) => { buffer.enqueue({ kind: "outbound_decision", decisionId: opts!.decisionId!, op, entityBindingRef: ref, payload }); return { ok: true }; } });
+      expect(released).toMatchObject({ state: "pending", released: 1 });
+      expect(buffer.pending()).toHaveLength(1);
+      if (change === "quiet back on") quietOn();
+      else if (change === "posting threshold raised") saveConfig({ ...DEFAULT_CONFIG, enabled: true, channel: "C-OWNER", secretsEnvFile: join(home, "slack.env"), minimumLevelThatPosts: "ALERT" }, home);
+      else db.prepare("UPDATE queue_items SET destination_session = ? WHERE qitem_id = ?").run("other@external", row.qitemId);
+      first.stop();
+      wire(); // restart: the gateway replays what's buffered
+      await settle();
+      expect(posts, `nothing posts after: ${change}`).toHaveLength(0);
+      const expected = change === "quiet back on" ? "quiet-release-returned " : "quiet-release-disposition ";
+      expect(notes(row).some((n) => n.startsWith(expected))).toBe(true);
+      if (change === "quiet back on") expect(releaseJobs()).toHaveLength(1); // still held, still owned by the job
+    });
+
+  it("full flow: the real release fails to post, quiet comes back under a newer window, and the restart's replay posts nothing", async () => {
+    quietOn();
+    const row = await ask();
+    const first = wire();
+    const alert = await alertFor(row);
+    first.dispatcher.dispatch(OUTBOUND_OP, alert.destinationSession!, toPayload(alert));
+    await settle();
+    quiet.end("person", { endedBy: "t", now: new Date() });
+    failPosts = true;
+    const [job] = releaseJobs();
+    expect(await runQuietRelease({ queueRepo: repo, jobsRepo: new WatchdogJobsRepository(db), home, jobId: job!.jobId,
+      registry: { loadHumanRegistry: registry as never },
+      dispatch: (op, ref, payload, opts) => first.dispatcher.dispatch(op, ref, payload, opts as never) })).toMatchObject({ state: "pending", released: 1 });
+    await settle();
+    expect(posts).toHaveLength(0);
+    expect(new DispatchBuffer(home).pending().filter((d) => d.decisionId.startsWith("quiet-release:"))).toHaveLength(1);
+    quietOn(); // a newer quiet revision
+    first.stop();
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true, loadHumanRegistry: registry as never });
+    failPosts = false;
+    wire(); // restart: startup replays the buffered release
+    await settle();
+    expect(posts).toHaveLength(0);
+    expect(notes(row).some((n) => n.startsWith("quiet-release-returned "))).toBe(true);
+    expect(releaseJobs()).toHaveLength(1);
+  });
+
+  it("the digest flush holds a pre-quiet ask for a quiet second person, under that person's window", async () => {
+    order = ["other", "person"];
+    const row = await ask();
+    const alert = await alertFor(row);
+    repo.update({ qitemId: row.qitemId, actorSession: "daemon@kernel", transitionNote: `delivery-decision: digest window=4h notification_key=${alert.notificationKey}` });
+    quietOn();
+    const w = wire();
+    await runDeliveryDigestFlush({ queueRepo: repo, registry: { loadHumanRegistry: registry as never }, home, window: "4h",
+      dispatch: (op, ref, payload, opts) => w.dispatcher.dispatch(op, ref, payload, opts as never) });
+    await settle();
+    expect(posts).toHaveLength(0);
+    expect(notes(row).some((n) => n.startsWith("delivery-decision: quiet-hold"))).toBe(true);
+    expect(releaseJobs()).toHaveLength(1);
+  });
+
+  it("the digest flush doesn't capture a non-quiet person's ask under someone else's quiet window", async () => {
+    const row = await ask({ destinationSession: "other@external" });
+    const alert = await alertFor(row);
+    repo.update({ qitemId: row.qitemId, actorSession: "daemon@kernel", transitionNote: `delivery-decision: digest window=4h notification_key=${alert.notificationKey}` });
+    quietOn(); // the first registered person is quiet; the ask's recipient isn't
+    const w = wire();
+    await runDeliveryDigestFlush({ queueRepo: repo, registry: { loadHumanRegistry: registry as never }, home, window: "4h",
+      dispatch: (op, ref, payload, opts) => w.dispatcher.dispatch(op, ref, payload, opts as never) });
+    await settle();
+    expect(posts).toHaveLength(1);
+    expect(notes(row).some((n) => n.startsWith("delivery-decision: quiet-hold"))).toBe(false);
+    expect(releaseJobs()).toHaveLength(0);
   });
 });
