@@ -11,7 +11,7 @@ import type { Migration } from "../migrate.js";
  * Mirrors migration 085 (rigs.claude_managed_block_file).
  */
 export const rigStartupLayersSchema: Migration = {
-  name: "120_rig_startup_layers.sql",
+  name: "121_rig_startup_layers.sql",
   sql: `
     ALTER TABLE rigs ADD COLUMN startup_layers_json TEXT;
   `,

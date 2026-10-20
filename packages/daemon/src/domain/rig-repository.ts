@@ -276,7 +276,7 @@ export class RigRepository {
   }
 
   /** The rig's `culture_file` and rig `startup` block as its spec declared them, and the absolute root their paths
-   *  resolve against (migration 120). A seat added to the rig later reads them back. Null when neither was declared. */
+   *  resolve against (migration 121). A seat added to the rig later reads them back. Null when neither was declared. */
   setRigStartupLayers(rigId: string, layers: RigStartupLayers | null): void {
     if (!this.hasRigColumn("startup_layers_json")) return;
     this.db.prepare("UPDATE rigs SET startup_layers_json = ?, updated_at = ? WHERE id = ?")

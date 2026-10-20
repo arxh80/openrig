@@ -1,5 +1,5 @@
 import { seatIdentityPanePidSchema } from "../../src/db/migrations/119_seat_identity_pane_pid.js";
-import { rigStartupLayersSchema } from "../../src/db/migrations/120_rig_startup_layers.js";
+import { rigStartupLayersSchema } from "../../src/db/migrations/121_rig_startup_layers.js";
 import { rigInstallRootSchema } from "../../src/db/migrations/096_rig_install_root.js";
 import { threadPartMapSchema } from "../../src/db/migrations/097_thread_part_map.js";
 import { queueTransitionsQitemIdOrderSchema } from "../../src/db/migrations/098_queue_transitions_qitem_id_order.js";
