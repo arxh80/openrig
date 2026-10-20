@@ -101,11 +101,14 @@ export class SlackOutboundDriver {
       const dispatched: string[] = [];
       const refused: { qitemId: string; error: string }[] = [];
       for (const alert of fresh) {
+        // Marked in flight BEFORE dispatching: the delivery layer can run synchronously inside dispatch and release the
+        // key (a deferred decision does), and that release must win over this mark, or the ask is never offered again.
+        this.inflight.add(notificationKey(alert));
         const res = this.deps.dispatch(OUTBOUND_OP, alert.destinationSession ?? "(unknown)", toPayload(alert));
         if (res.ok) {
-          this.inflight.add(notificationKey(alert));
           dispatched.push(alert.qitemId);
         } else {
+          this.inflight.delete(notificationKey(alert));
           // Refused (e.g. delivery layer unconfigured → op unadvertised): honest, retried next
           // sweep — nothing durable was minted, so this is not a retained decision.
           refused.push({ qitemId: alert.qitemId, error: res.error });
@@ -120,9 +123,11 @@ export class SlackOutboundDriver {
     }
   }
 
-  /** The delivery layer marked a qitem seen (delivered) — release the in-memory guard. */
-  release(qitemId: string): void {
-    this.inflight.delete(qitemId);
+  /** The delivery layer is done with an offer — release the in-memory guard. The guard is keyed by notification key
+   *  (`qitemId:transitionId` for a real alert); a caller that passes the bare qitem id releases nothing for such a key,
+   *  which is harmless when it has also marked the key seen (the sweep excludes seen keys) but not otherwise. */
+  release(key: string): void {
+    this.inflight.delete(key);
   }
 
   stop(): void {

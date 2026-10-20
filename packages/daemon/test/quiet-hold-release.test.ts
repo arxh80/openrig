@@ -17,6 +17,7 @@ import { DEFAULT_CONFIG, saveConfig } from "../src/domain/gateway/slack/config.j
 import { buildSlackGatewayWire } from "../src/domain/gateway/slack/slack-subsystem.js";
 import { OUTBOUND_OP, toPayload } from "../src/domain/gateway/slack/outbound-driver.js";
 import { DispatchBuffer } from "../src/domain/gateway/dispatch-buffer.js";
+import { SlackOutboundDriver } from "../src/domain/gateway/slack/outbound-driver.js";
 import { resolveSlackHandle } from "../src/domain/gateway/human-registry.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 import { HumanQuietStore, quietHoldFor } from "../src/domain/gateway/human-quiet-windows.js";
@@ -477,6 +478,30 @@ describe("after QA: changed circumstances and a second person", () => {
     const bare = new Database(":memory:");
     expect(quietHoldFor(bare, "person", new Date())).toBeNull();
     bare.close();
+  });
+
+  it("after QA: a decision deferred by a failed quiet read leaves the ask for the real sweep to offer again, and it's held then", async () => {
+    quietOn();
+    let driver: SlackOutboundDriver | undefined;
+    const start = SlackOutboundDriver.prototype.start;
+    const captured = vi.spyOn(SlackOutboundDriver.prototype, "start").mockImplementation(function (this: SlackOutboundDriver) { driver = this; start.call(this); });
+    const row = await ask();
+    wire();
+    captured.mockRestore();
+    const read = vi.spyOn(HumanQuietStore.prototype, "quietStateFor").mockImplementation(() => { throw new Error("disk I/O error (test)"); });
+    try {
+      const first = await driver!.sweepOnce();
+      await settle();
+      expect(first.dispatched).toEqual([row.qitemId]);
+      expect(posts).toHaveLength(0);
+      expect(notes(row).some((n) => n.startsWith("delivery-decision: "))).toBe(false);
+    } finally { read.mockRestore(); }
+    const second = await driver!.sweepOnce(); // the quiet state is readable again
+    await settle();
+    expect(second.fresh, "the deferred ask is offered again without a restart").toBe(1);
+    expect(posts).toHaveLength(0);
+    expect(notes(row).some((n) => n.startsWith("delivery-decision: quiet-hold "))).toBe(true);
+    expect(releaseJobs()).toHaveLength(1);
   });
 
   it("the digest flush holds a pre-quiet ask for a quiet second person, under that person's window", async () => {

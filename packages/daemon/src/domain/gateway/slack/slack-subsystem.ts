@@ -721,7 +721,8 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       // The decision couldn't be made (for example the person's quiet hours couldn't be read): post nothing and record
       // nothing. Releasing the in-flight guard lets the outbound sweep offer this still-unseen ask again and decide afresh.
       log(`delivery decision for ${p.qitemId} deferred: ${(error as Error).message}`);
-      releaseRef(p.qitemId!);
+      // Released by notification key, the guard's own key: nothing marks this ask seen, so the next sweep must see it.
+      releaseRef(p.notificationKey ?? p.qitemId!);
       return { ok: true as const };
     }
     if (ruled) {
