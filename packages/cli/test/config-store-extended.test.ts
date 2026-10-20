@@ -658,6 +658,47 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
     expect(existsSync(configPath)).toBe(false);
   });
 
+  it("reset(key) removes a section it leaves empty", () => {
+    const store = new ConfigStore(configPath);
+    store.set("transport.local_user_guard", "true");
+    store.reset("transport.local_user_guard");
+    const raw = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(raw.transport).toBeUndefined();
+  });
+
+  it("reset(key) keeps the section when a sibling key remains", () => {
+    const store = new ConfigStore(configPath);
+    store.set("transport.local_user_guard", "true");
+    store.set("transport.verify_input_box", "true");
+    store.reset("transport.local_user_guard");
+    const raw = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(raw.transport).toEqual({ verifyInputBox: true });
+  });
+
+  it("reset(key) leaves unrelated unknown keys elsewhere in the file alone", () => {
+    const store = new ConfigStore(configPath);
+    store.set("transport.local_user_guard", "true");
+    const raw1 = JSON.parse(readFileSync(configPath, "utf8"));
+    raw1.someOtherTool = { leaveMeAlone: true };
+    writeFileSync(configPath, JSON.stringify(raw1, null, 2) + "\n");
+    store.reset("transport.local_user_guard");
+    const raw2 = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(raw2.someOtherTool).toEqual({ leaveMeAlone: true });
+    expect(raw2.transport).toBeUndefined();
+  });
+
+  it("reset(key) leaves a pre-existing unrelated empty object alone", () => {
+    const store = new ConfigStore(configPath);
+    store.set("transport.local_user_guard", "true");
+    const raw1 = JSON.parse(readFileSync(configPath, "utf8"));
+    raw1.unrelatedEmptySection = {};
+    writeFileSync(configPath, JSON.stringify(raw1, null, 2) + "\n");
+    store.reset("transport.local_user_guard");
+    const raw2 = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(raw2.unrelatedEmptySection).toEqual({});
+    expect(raw2.transport).toBeUndefined();
+  });
+
   it("resolveAllWithSource returns every valid key with source + default", () => {
     const store = new ConfigStore(configPath);
     const all = store.resolveAllWithSource();

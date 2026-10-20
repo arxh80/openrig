@@ -772,6 +772,22 @@ function getNestedValue(obj: Record<string, unknown>, parts: string[]): unknown 
   return current;
 }
 
+/**
+ * After a reset deletes a leaf key, remove any now-empty object literals along
+ * the leaf's own parent path, walking from the deepest parent toward the root.
+ * Stops as soon as a parent still has a key (a sibling, or an unrelated key),
+ * so unrelated empty objects elsewhere in the file are never touched. If the
+ * walk empties the root itself, it is left as `{}` rather than removed.
+ */
+function pruneEmptyAncestors(root: Record<string, unknown>, parentParts: string[]): void {
+  for (let depth = parentParts.length; depth >= 1; depth--) {
+    const obj = getNestedValue(root, parentParts.slice(0, depth));
+    if (obj == null || typeof obj !== "object" || Object.keys(obj).length > 0) break;
+    const grandparent = depth === 1 ? root : (getNestedValue(root, parentParts.slice(0, depth - 1)) as Record<string, unknown>);
+    delete grandparent[parentParts[depth - 1]!];
+  }
+}
+
 function setNestedValue(obj: Record<string, unknown>, parts: string[], value: unknown): void {
   let current = obj;
   for (let i = 0; i < parts.length - 1; i++) {
@@ -1452,6 +1468,7 @@ export class ConfigStore {
           throw new Error(`Invalid context-pressure policy: warning (${warning}) must be less than critical (${critical})`);
         }
       }
+      pruneEmptyAncestors(fileConfig, parentParts);
     }
     this.writeConfig(JSON.stringify(fileConfig, null, 2) + "\n");
   }
