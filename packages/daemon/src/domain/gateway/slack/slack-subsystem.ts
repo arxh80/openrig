@@ -706,6 +706,26 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     return undefined;
   };
 
+  // A partly posted decision is finished only for an ask still owed. Once every ask it carries is resolved (a posted
+  // receipt, or a quiet-release disposition: the row closed, was superseded, moved to someone else or fell below the
+  // posting threshold), it is drained without posting. Only when all are: a later part can carry several digest
+  // members and its text is fixed by the recorded cuts, so while any member is still owed the post finishes whole (its
+  // first part already showed every member). A key with only a hold note isn't resolved: its release still owns it.
+  const carriedKeys = (payload: unknown) => {
+    const q = (payload ?? {}) as OutboundPostPayload & { memberReceipts?: Array<{ qitemId: string; notificationKey: string }> };
+    return q.memberReceipts ?? (q.qitemId ? [{ qitemId: q.qitemId, notificationKey: q.notificationKey ?? q.qitemId }] : []);
+  };
+  const keyResolved = (m: { qitemId: string; notificationKey: string }) =>
+    opts.queueRepo.transitionLog.hasOwnerNotificationReceipt(m.qitemId, m.notificationKey)
+    || opts.queueRepo.listTransitions(m.qitemId).some((t) => (t.transitionNote ?? "").startsWith("quiet-release-disposition ")
+      && (t.transitionNote ?? "").split(/\s+/).includes(`notification_key=${m.notificationKey}`));
+  const drainable = (d: Parameters<SubsystemDeliverFn>[0]) => {
+    if ((d.payload as { quietRelease?: boolean } | undefined)?.quietRelease) return false;
+    if (!("unfinished" in deliver) || !(deliver as { unfinished: (x: typeof d) => boolean }).unfinished(d)) return false;
+    const keys = carriedKeys(d.payload);
+    return keys.length > 0 && keys.every(keyResolved);
+  };
+
   // A digest post was decided before it was posted. By the time it is delivered (a buffered post replayed after a
   // restart, say), some members may already be owned elsewhere: posted (a receipt), or held for quiet hours (a hold
   // note, so the window's release job posts it). And if the recipient's quiet hours began in between, its routine
@@ -776,6 +796,10 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
         return { ok: true as const };
       }
     }
+    if (drainable(decision)) {
+      log(`partly posted ${decision.decisionId} not finished: every ask it carries is resolved`);
+      return { ok: true as const };
+    }
     // The T+30 deferral FIRE executes an already-made decision — never re-consult
     // (a re-consult would re-defer: the immediate-plus-deferred shape AM-F3 forbids).
     // R2 B-3 belt: an episode that already carries its posted receipt (a replayed
@@ -812,6 +836,18 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
         const finished = await deliver(original);
         if (finished.ok) ackRef(original.decisionId);
         return finished;
+      }
+      // A disposition resolves the ask now: a retained partly posted original that carries only resolved asks is drained
+      // here rather than at the next restart. (A disposition the release job writes can't reach the buffer; the lazy
+      // drain at the top of delivery covers that one.)
+      if (verdict === "declined" && p.qitemId) {
+        try {
+          for (const d of new DispatchBuffer(opts.home).pendingStrict()) {
+            if (!d.decisionId.startsWith("quiet-release:") && carriedKeys(d.payload).some((m) => m.notificationKey === key) && drainable(d)) ackRef(d.decisionId);
+          }
+        } catch (error) {
+          log(`retained originals for ${key} not checked: ${(error as Error).message}`);
+        }
       }
       // Declined (the row says why) or couldn't be checked (nothing written): either way nothing posts now. Acking is
       // safe because the window's release job owns redelivery until the ask has a receipt or a disposition; keeping it

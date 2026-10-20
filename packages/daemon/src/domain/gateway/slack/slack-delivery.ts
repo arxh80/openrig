@@ -601,7 +601,15 @@ export async function deliveryLanding(opts: SubsystemSlackDeliveryOpts, decision
   return first === "found" && firstId === multipart ? "partial" : first;
 }
 
-export type SubsystemSlackDeliverFn = SubsystemDeliverFn & { landing: (decision: OutboundDecision) => ReturnType<typeof deliveryLanding> };
+/** Whether a post split into parts was started (its first part attempted) but isn't recorded complete. No Slack read. */
+export function multipartUnfinished(opts: SubsystemSlackDeliveryOpts, decision: OutboundDecision): boolean {
+  return !opts.delivered.load().has(decision.decisionId) && opts.attempted.load().has(`${decision.decisionId}:part:1`);
+}
+
+export type SubsystemSlackDeliverFn = SubsystemDeliverFn & {
+  landing: (decision: OutboundDecision) => ReturnType<typeof deliveryLanding>;
+  unfinished: (decision: OutboundDecision) => boolean;
+};
 
 export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): SubsystemSlackDeliverFn {
   const fn: SubsystemDeliverFn = async (decision) => {
@@ -733,5 +741,8 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
       return { ok: false, class: "receipt-failed", detail: (error as Error).message };
     }
   };
-  return Object.assign(fn, { landing: (decision: OutboundDecision) => deliveryLanding(opts, decision) });
+  return Object.assign(fn, {
+    landing: (decision: OutboundDecision) => deliveryLanding(opts, decision),
+    unfinished: (decision: OutboundDecision) => multipartUnfinished(opts, decision),
+  });
 }

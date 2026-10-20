@@ -722,6 +722,41 @@ describe("after QA: changed circumstances and a second person", () => {
     expect(releaseJobs()).toHaveLength(0);
   });
 
+  it("review 5b: a partly posted ask the release disposed of isn't finished by a later replay outside quiet", async () => {
+    const { row, first } = await partlyPosted();
+    quietOnFor("other");
+    const w = restart(first); // held, the original retained
+    await settle();
+    db.prepare("UPDATE queue_items SET destination_session = ? WHERE qitem_id = ?").run("person@external", row.qitemId);
+    quiet.end("other", { endedBy: "t", now: new Date() });
+    await release(); // the job finds the recipient changed: a disposition, nothing dispatched
+    expect(notes(row).some((n) => n.startsWith("quiet-release-disposition "))).toBe(true);
+    restart(w); // outside quiet: the retained original replays
+    await settle();
+    expect(posts, "no part 2 for a disposed ask").toHaveLength(1);
+    expect(new DispatchBuffer(home).pending(), "the original is drained").toHaveLength(0);
+  });
+
+  it("review 5b: a disposition at post time drains the retained original straight away, with no restart", async () => {
+    const { row, first } = await partlyPosted();
+    quietOnFor("other");
+    const w = restart(first);
+    await settle();
+    quiet.end("other", { endedBy: "t", now: new Date() });
+    for (const job of releaseJobs()) {
+      await runQuietRelease({ queueRepo: repo, jobsRepo: new WatchdogJobsRepository(db), home, jobId: job.jobId, registry: { loadHumanRegistry: registry as never },
+        dispatch: (op, ref, payload, opts) => {
+          // Between the job's check and the post: the ask moves to someone else.
+          db.prepare("UPDATE queue_items SET destination_session = ? WHERE qitem_id = ?").run("person@external", row.qitemId);
+          return w.dispatcher.dispatch(op, ref, payload, opts as never);
+        } });
+    }
+    await settle();
+    expect(notes(row).some((n) => n.startsWith("quiet-release-disposition "))).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(new DispatchBuffer(home).pending(), "both the release and the original are drained").toHaveLength(0);
+  });
+
   it("review 5: a two-part release that partly posted, replayed after quiet came back, posts nothing; the next release finishes it", async () => {
     quietOn();
     const row = await ask({ humanDetail: "The full supplemental detail for this decision." });
