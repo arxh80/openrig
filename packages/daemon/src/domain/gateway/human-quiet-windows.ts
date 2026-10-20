@@ -245,13 +245,16 @@ export function parseDailyRule(value: string): { start: string; end: string } {
   return { start: m[1]!, end: m[2]! };
 }
 
-/** The person's quiet window when it's on now, as the delivery decision takes it; null when it's off. A database
- *  without the quiet-hours table (an older test schema) reads as off, which is today's behaviour. */
+/** The person's quiet window when it's on now, as the delivery decision takes it; null when it's off. Only a database
+ *  without the quiet-hours table (an older schema) reads as off, which is today's behaviour. Any other failure to read
+ *  it throws: a caller must not take "can't tell" as "not quiet" and post. */
 export function quietHoldFor(db: Database.Database, entityId: string, now: Date): { windowId: string; occurrence: string; revision: number } | null {
+  let state: QuietState;
   try {
-    const state = new HumanQuietStore(db).quietStateFor(entityId, now);
-    return state.active ? { windowId: state.windowId, occurrence: state.occurrence, revision: state.revision } : null;
-  } catch {
-    return null;
+    state = new HumanQuietStore(db).quietStateFor(entityId, now);
+  } catch (error) {
+    if (/no such table: human_quiet_windows/.test((error as Error).message)) return null;
+    throw error;
   }
+  return state.active ? { windowId: state.windowId, occurrence: state.occurrence, revision: state.revision } : null;
 }

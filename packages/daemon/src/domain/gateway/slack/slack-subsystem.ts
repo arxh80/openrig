@@ -520,7 +520,9 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
           if ((p as { deliveryDigestPost?: boolean }).deliveryDigestPost) return undefined; // notify-class aggregate, never a mention
           if ((p as { quietRelease?: boolean }).quietRelease) return undefined; // releasing a quiet hold: posted, never a mention
           const fire = (p as { deliveryDeferralFire?: boolean }).deliveryDeferralFire === true;
-          const decision = fire ? null : decideForPayload(p);
+          // At post time the decision was just made; if it can't be re-read now (quiet hours unreadable), no mention.
+          let decision: DeliveryDecision | null;
+          try { decision = fire ? null : decideForPayload(p); } catch { return undefined; }
           const eligible = fire
             ? true // the deferred interrupt mentions at fire time — that IS the deferral's promise
             : decision
@@ -688,7 +690,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
         releaseRef(p.qitemId);
         return { ok: true as const };
       }
-      const post = !p.qitemId || await confirmReleaseAtPost({
+      const verdict = !p.qitemId ? "post" : await confirmReleaseAtPost({
         queueRepo: opts.queueRepo,
         jobsRepo: new WatchdogJobsRepository(opts.queueRepo.db),
         home: opts.home,
@@ -697,7 +699,10 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
         qitemId: p.qitemId,
         notificationKey: key,
       });
-      if (post) return deliver(decision);
+      if (verdict === "post") return deliver(decision);
+      // Declined (the row says why) or couldn't be checked (nothing written): either way nothing posts now. Acking is
+      // safe because the window's release job owns redelivery until the ask has a receipt or a disposition; keeping it
+      // buffered would wait for a restart and block the job's own re-dispatch of the same decision id.
       releaseRef(p.qitemId);
       return { ok: true as const };
     }
@@ -709,7 +714,16 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       }
       return deliver(decision);
     }
-    const ruled = p.qitemId ? decideForPayload(p) : null;
+    let ruled: DeliveryDecision | null;
+    try {
+      ruled = p.qitemId ? decideForPayload(p) : null;
+    } catch (error) {
+      // The decision couldn't be made (for example the person's quiet hours couldn't be read): post nothing and record
+      // nothing. Releasing the in-flight guard lets the outbound sweep offer this still-unseen ask again and decide afresh.
+      log(`delivery decision for ${p.qitemId} deferred: ${(error as Error).message}`);
+      releaseRef(p.qitemId!);
+      return { ok: true as const };
+    }
     if (ruled) {
       recordTerminationOnce(p, ruled);
       const episodeKey = p.notificationKey ?? p.qitemId;

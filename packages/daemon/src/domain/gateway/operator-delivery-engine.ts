@@ -98,8 +98,9 @@ export function makeOperatorDeliveryEngine(deps: {
           minimumLevelThatPosts: cfg.minimumLevelThatPosts,
           minimumLevelThatInterrupts: cfg.minimumLevelThatInterrupts,
         },
-        // Read for one engine input; an escalation is never held, so quiet doesn't change this rung's decision.
-        quiet: quietHoldFor(deps.queueRepo.db, human.entityId, new Date()),
+        // An escalation is never held, so quiet can't change this rung's decision: a failed quiet read is ignored here
+        // rather than blocking the escalation.
+        quiet: (() => { try { return quietHoldFor(deps.queueRepo.db, human.entityId, new Date()); } catch { return null; } })(),
       });
 
       const payload = {
