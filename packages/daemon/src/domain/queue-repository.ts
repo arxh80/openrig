@@ -2526,6 +2526,11 @@ export class QueueRepository {
     return { qitemId: input.qitemId, ...result };
   }
 
+  /** Notify subscribers of events persisted inside a caller's own transaction (updateWithinTransaction), after it commits. */
+  notifyCommitted(events: readonly PersistedEvent[]): void {
+    for (const event of events) this.eventBus.notifySubscribers(event);
+  }
+
   /** Internal read-only audit pointer for non-state receipts. Never search past a state write. */
   retainedClaimBlocker(qitemId: string): string | undefined {
     const latest = this.transitionLog.listForQitem(qitemId).at(-1);

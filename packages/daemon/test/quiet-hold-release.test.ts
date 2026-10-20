@@ -505,6 +505,59 @@ describe("after QA: changed circumstances and a second person", () => {
     expect(releaseJobs()).toHaveLength(1);
   });
 
+  it("review: a hold whose release job can't be registered leaves nothing half-written; the next flush holds it properly and it posts once", async () => {
+    const row = await ask();
+    const alert = await alertFor(row);
+    repo.update({ qitemId: row.qitemId, actorSession: "daemon@kernel", transitionNote: `delivery-decision: digest window=4h notification_key=${alert.notificationKey}` });
+    quietOn();
+    const w = wire();
+    const flush = () => runDeliveryDigestFlush({ queueRepo: repo, registry: { loadHumanRegistry: registry as never }, home, window: "4h",
+      dispatch: (op, ref, payload, opts) => w.dispatcher.dispatch(op, ref, payload, opts as never) });
+    const register = vi.spyOn(WatchdogJobsRepository.prototype, "register").mockImplementationOnce(() => { throw new Error("job table busy (test)"); });
+    await expect(flush()).rejects.toThrow(/job table busy/);
+    register.mockRestore();
+    expect(notes(row).some((n) => n.startsWith("delivery-decision: quiet-hold "))).toBe(false); // no note without its job
+    expect(releaseJobs()).toHaveLength(0);
+    await flush(); // the next flush holds it, with its job
+    expect(notes(row).some((n) => n.startsWith("delivery-decision: quiet-hold "))).toBe(true);
+    expect(releaseJobs()).toHaveLength(1);
+    quiet.end("person", { endedBy: "t", now: new Date() });
+    await runQuietRelease({ queueRepo: repo, jobsRepo: new WatchdogJobsRepository(db), home, jobId: releaseJobs()[0]!.jobId,
+      registry: { loadHumanRegistry: registry as never }, dispatch: (op, ref, payload, opts) => w.dispatcher.dispatch(op, ref, payload, opts as never) });
+    await settle();
+    expect(posts).toHaveLength(1);
+  });
+
+  it("review: a digest post decided before quiet began and replayed during it holds its routine ask; an escalation in it still posts", async () => {
+    const routine = await ask();
+    const urgent = await ask({ tags: ["escalation"] }); // escalated since its digest decision
+    for (const row of [routine, urgent]) {
+      const a = await alertFor(row);
+      repo.update({ qitemId: row.qitemId, actorSession: "daemon@kernel", transitionNote: `delivery-decision: digest window=4h notification_key=${a.notificationKey}` });
+    }
+    const first = wire();
+    failPosts = true; // (2) transport fails before the digest posts: it stays in the durable buffer
+    await runDeliveryDigestFlush({ queueRepo: repo, registry: { loadHumanRegistry: registry as never }, home, window: "4h",
+      dispatch: (op, ref, payload, opts) => first.dispatcher.dispatch(op, ref, payload, opts as never) });
+    await settle();
+    expect(posts).toHaveLength(0);
+    expect(new DispatchBuffer(home).pending().length).toBeGreaterThan(0);
+    quietOn(); // (3)
+    first.stop();
+    failPosts = false;
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true, loadHumanRegistry: registry as never });
+    const second = wire(); // (4) the restart replays the buffered digest during quiet
+    await settle();
+    expect(posts.map((p) => JSON.stringify(p)).filter((p) => p.includes(String(routine.body)))).toHaveLength(0);
+    expect(posts.map((p) => JSON.stringify(p)).filter((p) => p.includes(String(urgent.body)))).toHaveLength(1);
+    expect(notes(routine).some((n) => n.startsWith("delivery-decision: quiet-hold "))).toBe(true);
+    quiet.end("person", { endedBy: "t", now: new Date() });
+    await runQuietRelease({ queueRepo: repo, jobsRepo: new WatchdogJobsRepository(db), home, jobId: releaseJobs()[0]!.jobId,
+      registry: { loadHumanRegistry: registry as never }, dispatch: (op, ref, payload, opts) => second.dispatcher.dispatch(op, ref, payload, opts as never) });
+    await settle();
+    expect(posts.map((p) => JSON.stringify(p)).filter((p) => p.includes(String(routine.body)))).toHaveLength(1);
+  });
+
   it("the digest flush holds a pre-quiet ask for a quiet second person, under that person's window", async () => {
     order = ["other", "person"];
     const row = await ask();

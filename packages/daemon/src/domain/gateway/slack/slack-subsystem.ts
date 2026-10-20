@@ -663,6 +663,37 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     outboundSeen.mark(key, "dropped-row-not-active");
     releaseRef(key);
   };
+  // A digest post was decided before it was posted. If its recipient's quiet hours began in between (a buffered post
+  // replayed after a restart, say), its routine members are held for quiet now, under that window, rather than posted
+  // into it; a member that has since become an escalation still posts. If the quiet state can't be read, nothing posts:
+  // the members keep their digest notes, so the next flush selects them again.
+  const deliverDigestPost = async (decision: Parameters<SubsystemDeliverFn>[0], p: OutboundPostPayload) => {
+    const recipient = (p.destinationSession ?? "").split("@")[0] ?? "";
+    let quiet: ReturnType<typeof quietHoldFor>;
+    try {
+      quiet = recipient ? quietHoldFor(opts.queueRepo.db, recipient, new Date()) : null;
+    } catch (error) {
+      log(`digest post ${decision.decisionId} not posted: quiet hours couldn't be read: ${(error as Error).message}`);
+      return { ok: true as const };
+    }
+    if (!quiet) return deliver(decision);
+    const aggregate = (p as { memberReceipts?: Array<{ qitemId: string; notificationKey: string }> }).memberReceipts;
+    const members = aggregate ?? (p.qitemId ? [{ qitemId: p.qitemId, notificationKey: p.notificationKey ?? p.qitemId }] : []);
+    const jobsRepo = new WatchdogJobsRepository(opts.queueRepo.db);
+    const kept = members.filter((m) => {
+      const row = opts.queueRepo.getById(m.qitemId);
+      if (row && row.humanIntent !== "update" && isEscalationClass(row.tags)) return true;
+      holdForQuiet({ queueRepo: opts.queueRepo, jobsRepo, qitemId: m.qitemId, entityId: recipient, hold: { ...quiet!, notificationKey: m.notificationKey } });
+      return false;
+    });
+    if (kept.length === 0) return { ok: true as const };
+    if (!aggregate || kept.length === aggregate.length) return deliver(decision);
+    const keptIds = new Set(kept.map((m) => m.qitemId));
+    const body = String(p.body ?? "").split("\n").filter((line) => [...keptIds].some((id) => line.endsWith(`[${id}]`))).join("\n");
+    const summary = String(p.summary ?? "").replace(/— \d+ item\(s\)/, `— ${kept.length} item(s)`);
+    return deliver({ ...decision, payload: { ...p, memberReceipts: kept, body, summary } } as typeof decision);
+  };
+
   const engineDeliver: SubsystemDeliverFn = async (decision) => {
     const p = ((decision as { payload?: unknown }).payload ?? {}) as OutboundPostPayload & { deliveryDeferralFire?: boolean };
     // The decision-resolved notice is written at closure, so a closed row is its normal case.
@@ -680,7 +711,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     // decision, or any second mint) posts NOTHING — exactly-once by the receipt.
     // A digest post is an already-decided aggregate — never re-consulted
     // (member decisions were recorded at containment; receipts land in onPosted).
-    if ((p as { deliveryDigestPost?: boolean }).deliveryDigestPost) return deliver(decision);
+    if ((p as { deliveryDigestPost?: boolean }).deliveryDigestPost) return deliverDigestPost(decision, p);
     // Releasing an ask held for quiet hours: it posts as itself, never re-consulted (that would digest C and D again). A
     // receipt means it already did. A release can wait in the buffer (and be replayed after a restart), so it is
     // re-checked here, at post time, against the recipient's quiet, the row and the posting threshold as they are now.

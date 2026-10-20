@@ -48,7 +48,8 @@ export function parseQuietHoldNote(note: string): QuietHold | null {
 const hasToken = (note: string, prefix: string, key: string): boolean =>
   note.startsWith(`${prefix} `) && note.split(/\s+/).includes(`notification_key=${key}`);
 
-/** Record a held ask on its row (once per episode) and make sure its window's release job is armed. */
+/** Record a held ask on its row (once per episode) and make sure its window's release job is armed: one SQLite
+ *  transaction, so a hold note never commits without the job that releases it (or the reverse). */
 export function holdForQuiet(input: {
   queueRepo: QueueRepository;
   jobsRepo: WatchdogJobsRepository;
@@ -56,11 +57,20 @@ export function holdForQuiet(input: {
   entityId: string;
   hold: QuietHold;
 }): void {
-  const notes = input.queueRepo.listTransitions(input.qitemId).map((t) => t.transitionNote ?? "");
-  if (!notes.some((n) => parseQuietHoldNote(n)?.notificationKey === input.hold.notificationKey)) {
-    input.queueRepo.update({ qitemId: input.qitemId, actorSession: "daemon@kernel", transitionNote: formatQuietHoldNote(input.hold) });
-  }
-  armQuietRelease({ jobsRepo: input.jobsRepo, windowId: input.hold.windowId, entityId: input.entityId });
+  noteWithReleaseJob(input.queueRepo, input.jobsRepo, input.hold.windowId, input.entityId, input.qitemId, (notes) =>
+    notes.some((n) => parseQuietHoldNote(n)?.notificationKey === input.hold.notificationKey) ? null : formatQuietHoldNote(input.hold));
+}
+
+/** Arm the window's release job and write a note on the row, together or not at all. `note` returns the note to write,
+ *  or null when the row already has it. Events from the note are delivered only after the transaction commits. */
+function noteWithReleaseJob(queueRepo: QueueRepository, jobsRepo: WatchdogJobsRepository, windowId: string, entityId: string,
+  qitemId: string, note: (existing: string[]) => string | null): void {
+  const events = queueRepo.db.transaction(() => {
+    armQuietRelease({ jobsRepo, windowId, entityId });
+    const text = note(queueRepo.listTransitions(qitemId).map((t) => t.transitionNote ?? ""));
+    return text ? queueRepo.updateWithinTransaction({ qitemId, actorSession: "daemon@kernel", transitionNote: text }).persistedEvents : [];
+  })();
+  queueRepo.notifyCommitted(events);
 }
 
 /** One active release job per quiet window; an existing one is reused. */
@@ -148,9 +158,8 @@ export async function confirmReleaseAtPost(input: {
   const key = input.notificationKey;
   if (verdict.kind === "quiet") {
     // Quiet came back on before this release posted: it stays held, and its window's job releases it next time.
-    input.queueRepo.update({ qitemId: input.qitemId, actorSession: "daemon@kernel",
-      transitionNote: `${RETURNED_PREFIX} window=${verdict.windowId} notification_key=${key} reason=quiet-on` });
-    armQuietRelease({ jobsRepo: input.jobsRepo, windowId: verdict.windowId, entityId: input.entityId });
+    noteWithReleaseJob(input.queueRepo, input.jobsRepo, verdict.windowId, input.entityId, input.qitemId,
+      () => `${RETURNED_PREFIX} window=${verdict.windowId} notification_key=${key} reason=quiet-on`);
     return "declined";
   }
   const notes = input.queueRepo.listTransitions(input.qitemId).map((t) => t.transitionNote ?? "");
@@ -188,14 +197,7 @@ export async function runQuietRelease(input: RunQuietReleaseInput): Promise<{ st
   }
 
   // Every ask held under this window, whichever occurrence or revision held it.
-  const held = new Map<string, string>(); // notification key → qitem id
-  const rows = input.queueRepo.db.prepare(
-    "SELECT qitem_id AS qitemId, transition_note AS note FROM queue_transitions WHERE transition_note LIKE ? ORDER BY transition_id",
-  ).all(`${HOLD_PREFIX} window=${windowId} %`) as Array<{ qitemId: string; note: string }>;
-  for (const r of rows) {
-    const hold = parseQuietHoldNote(r.note);
-    if (hold && hold.windowId === windowId) held.set(hold.notificationKey, r.qitemId);
-  }
+  const held = new Map<string, string>(heldKeys(input.queueRepo, windowId)); // notification key → qitem id
 
   // Unknown (null) when the registry can't be loaded: every held ask then reads as unavailable and stays open.
   const alerts = await currentAlerts(input.queueRepo, input.home, input.registry);
@@ -204,7 +206,7 @@ export async function runQuietRelease(input: RunQuietReleaseInput): Promise<{ st
   let open = 0;
   for (const [key, qitemId] of held) {
     const notes = input.queueRepo.listTransitions(qitemId).map((t) => t.transitionNote ?? "");
-    if (notes.some((n) => hasToken(n, "slack-owner-notification-posted", key) || hasToken(n, DISPOSITION_PREFIX, key))) continue;
+    if (resolved(input.queueRepo, qitemId, key, notes)) continue;
     const verdict = alerts === null
       ? { kind: "unavailable" as const, detail: "the human registry couldn't be loaded" }
       : await releaseVerdict({ queueRepo: input.queueRepo, home: input.home, registry: input.registry, entityId, qitemId,
@@ -223,11 +225,34 @@ export async function runQuietRelease(input: RunQuietReleaseInput): Promise<{ st
       transitionNote: `${DISPOSITION_PREFIX} window=${windowId} notification_key=${key} reason=${verdict.reason}` });
     dispositions++;
   }
+  // Before retiring, read the held set again with no await in between: an ask held while this pass was awaiting the
+  // alert list belongs to this window's job, which must not retire under it.
+  if (open === 0 && heldKeys(input.queueRepo, windowId).some(([key, qitemId]) => !resolved(input.queueRepo, qitemId, key))) {
+    return { state: "pending", released, dispositions };
+  }
   if (open === 0) {
     input.jobsRepo.markTerminal(input.jobId, "quiet release complete: every held ask posted or given a disposition");
     return { state: "released", released, dispositions };
   }
   return { state: "pending", released, dispositions };
+}
+
+function heldKeys(queueRepo: QueueRepository, windowId: string): Array<[string, string]> {
+  const rows = queueRepo.db.prepare(
+    "SELECT qitem_id AS qitemId, transition_note AS note FROM queue_transitions WHERE transition_note LIKE ? ORDER BY transition_id",
+  ).all(`${HOLD_PREFIX} window=${windowId} %`) as Array<{ qitemId: string; note: string }>;
+  const out: Array<[string, string]> = [];
+  for (const r of rows) {
+    const hold = parseQuietHoldNote(r.note);
+    if (hold && hold.windowId === windowId) out.push([hold.notificationKey, r.qitemId]);
+  }
+  return out;
+}
+
+/** Posted, or given a disposition: nothing more to release for this key. */
+function resolved(queueRepo: QueueRepository, qitemId: string, key: string, notes?: string[]): boolean {
+  const all = notes ?? queueRepo.listTransitions(qitemId).map((t) => t.transitionNote ?? "");
+  return all.some((n) => hasToken(n, "slack-owner-notification-posted", key) || hasToken(n, DISPOSITION_PREFIX, key));
 }
 
 /** Watchdog-engine policy wrapper: the scheduler's cadence drives evaluation; the current quiet state owns the timing. */
@@ -237,7 +262,7 @@ export function makeQuietReleasePolicy(deps: Omit<RunQuietReleaseInput, "jobId" 
     async evaluate(job: PolicyJob): Promise<PolicyEvaluation> {
       const r = await runQuietRelease({ ...deps, jobId: job.jobId });
       if (r.state === "released") return { action: "terminal", reason: "quiet release complete" };
-      return { action: "skip", reason: r.state === "quiet" ? "quiet is still on" : `released ${r.released}; awaiting receipts` };
+      return { action: "skip", reason: r.state === "quiet" ? "quiet_hours_still_on" : `released ${r.released}; awaiting receipts` };
     },
   } as Policy;
 }
