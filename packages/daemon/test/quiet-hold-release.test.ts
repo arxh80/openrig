@@ -311,6 +311,7 @@ describe("after QA: changed circumstances and a second person", () => {
   let failPosts = false;
   let loseResponses = false; // the post lands in Slack, but its response never reaches the gateway
   let historyIncomplete = false; // the reconciler's history scan stops early (more pages, no cursor): "maybe"
+  let failFromPost = 0; // when set, the Nth post and every one after it fail before posting
   let registryOk = true;
   const person = (id: string) => ({
     entityId: id, class: "human" as const, displayName: id, address: `${id}@external`,
@@ -330,6 +331,7 @@ describe("after QA: changed circumstances and a second person", () => {
     failPosts = false;
     loseResponses = false;
     historyIncomplete = false;
+    failFromPost = 0;
     registryOk = true;
     const secrets = join(home, "slack.env");
     writeFileSync(secrets, "SLACK_BOT_TOKEN=xoxb-EXAMPLE-fake\n", { mode: 0o600 });
@@ -342,7 +344,7 @@ describe("after QA: changed circumstances and a second person", () => {
       home, queueRepo: repo, registry: { loadHumanRegistry: registry as never, resolveSlackHandle }, outboundIntervalMs: 3_600_000,
       fetchImpl: async (url, init) => {
         if (String(url).includes("chat.postMessage")) {
-          if (failPosts) throw new Error("connector down before the post");
+          if (failPosts || (failFromPost && posts.length + 1 >= failFromPost)) throw new Error("connector down before the post");
           posts.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
           if (loseResponses) throw new Error("response lost after the post landed (test)");
           return new Response(JSON.stringify({ ok: true, ts: `1724.${100 + posts.length}` }), { status: 200, headers: { "content-type": "application/json" } });
@@ -647,6 +649,103 @@ describe("after QA: changed circumstances and a second person", () => {
     await settle();
     expect(posts, "no post into quiet").toHaveLength(1);
     expect(notes(row).some((n) => n.startsWith("quiet-release-returned "))).toBe(true);
+  });
+
+  // A routine two-part ask (primary plus supplemental detail) to a person who is posted to straight away: the primary
+  // lands outside quiet, the supplemental part fails, and the decision stays in the buffer.
+  async function partlyPosted() {
+    const row = await ask({ destinationSession: "other@external", humanDetail: "The full supplemental detail for this decision." });
+    const first = wire();
+    failFromPost = 2;
+    first.dispatcher.dispatch(OUTBOUND_OP, "other@external", toPayload((await alertFor(row)) as never));
+    await settle();
+    expect(posts).toHaveLength(1); // the primary is in Slack; the supplemental part isn't
+    expect(new DispatchBuffer(home).pending()).toHaveLength(1);
+    failFromPost = 0;
+    return { row, first };
+  }
+  const quietOnFor = (id: string) => { const now = new Date(); quiet.setUntil(id, { until: new Date(now.getTime() + 3_600_000), timezone: "UTC", setBy: "t", now }); };
+  const restart = (w: ReturnType<typeof wire>) => {
+    w.stop();
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: () => true, loadHumanRegistry: registry as never });
+    return wire();
+  };
+  const release = async () => {
+    for (const job of releaseJobs()) {
+      await runQuietRelease({ queueRepo: repo, jobsRepo: new WatchdogJobsRepository(db), home, jobId: job.jobId,
+        registry: { loadHumanRegistry: registry as never }, dispatch: (op, ref, payload, opts) => wires.at(-1)!.dispatcher.dispatch(op, ref, payload, opts as never) });
+    }
+    await settle();
+  };
+  const finishedAsContinuation = (row: QueueItem) => {
+    expect(posts).toHaveLength(2);
+    expect(posts[1]).toMatchObject({ channel: posts[0]!.channel, thread_ts: "1724.101" }); // in the primary's thread and channel
+    expect(String(posts[1]!.text)).toMatch(/:part:2\)$/); // the original decision's own second part
+    expect(posts.filter((post) => /:part:1\)$/.test(String(post.text)))).toHaveLength(1); // the primary, never again
+    expect(notes(row).filter((n) => n.startsWith("slack-owner-notification-posted "))).toHaveLength(1);
+  };
+
+  it("review 5: a partly posted ask replayed into quiet posts nothing; after quiet only its missing part posts, in the same thread", async () => {
+    const { row, first } = await partlyPosted();
+    quietOnFor("other");
+    restart(first); // the replay, during quiet
+    await settle();
+    expect(posts, "nothing posts during quiet").toHaveLength(1);
+    expect(notes(row).some((n) => n.startsWith("slack-owner-notification-posted ")), "no complete receipt yet").toBe(false);
+    expect(notes(row).some((n) => n.startsWith("delivery-decision: quiet-hold "))).toBe(true);
+    quiet.end("other", { endedBy: "t", now: new Date() });
+    await release();
+    finishedAsContinuation(row);
+    expect(new DispatchBuffer(home).pending()).toHaveLength(0);
+  });
+
+  it("review 5: restarts between the hold and the release still post only the missing part, once", async () => {
+    const { row, first } = await partlyPosted();
+    quietOnFor("other");
+    let w = restart(first);
+    await settle();
+    w = restart(w); // again, still during quiet
+    await settle();
+    expect(posts).toHaveLength(1);
+    quiet.end("other", { endedBy: "t", now: new Date() });
+    restart(w); // after quiet, before the release runs: the replay finishes it
+    await settle();
+    await release();
+    finishedAsContinuation(row);
+  });
+
+  it("review 5: outside quiet, a partly posted ask replayed after a restart finishes as before", async () => {
+    const { row, first } = await partlyPosted();
+    restart(first);
+    await settle();
+    finishedAsContinuation(row);
+    expect(releaseJobs()).toHaveLength(0);
+  });
+
+  it("review 5: a two-part release that partly posted, replayed after quiet came back, posts nothing; the next release finishes it", async () => {
+    quietOn();
+    const row = await ask({ humanDetail: "The full supplemental detail for this decision." });
+    const first = wire();
+    first.dispatcher.dispatch(OUTBOUND_OP, "person@external", toPayload(await alertFor(row)));
+    await settle();
+    expect(posts).toHaveLength(0); // held
+    quiet.end("person", { endedBy: "t", now: new Date() });
+    failFromPost = 2;
+    await release(); // the release's primary lands; its supplemental part fails
+    expect(posts).toHaveLength(1);
+    failFromPost = 0;
+    quietOn(); // quiet comes back on
+    restart(first); // the buffered release replays
+    await settle();
+    expect(posts, "nothing posts into quiet").toHaveLength(1);
+    expect(notes(row).some((n) => n.startsWith("quiet-release-returned "))).toBe(true);
+    expect(notes(row).some((n) => n.startsWith("slack-owner-notification-posted "))).toBe(false);
+    quiet.end("person", { endedBy: "t", now: new Date() });
+    await release(); // the job re-dispatches the same release, which finishes its own parts
+    expect(posts).toHaveLength(2);
+    expect(posts[1]).toMatchObject({ channel: posts[0]!.channel, thread_ts: "1724.101" });
+    expect(posts.filter((post) => /:part:1\)$/.test(String(post.text)))).toHaveLength(1);
+    expect(notes(row).filter((n) => n.startsWith("slack-owner-notification-posted "))).toHaveLength(1);
   });
 
   // An aggregate digest of two members, dispatched as the flush would: A is routine, B has since become an escalation.

@@ -588,15 +588,17 @@ function splitIntoParts(opts: SubsystemSlackDeliveryOpts, q: DeliveryPart, decis
 /** Whether an earlier attempt of this exact decision may already be in Slack, answered without posting anything:
  *  `unattempted` (never tried, or nothing of it recorded), or the reconciler's own verdict on its first message. A gate
  *  that would hold, trim or ack a decision asks this first, so a post that landed but lost its response is reconciled
- *  rather than sent again in another form. */
+ *  rather than sent again in another form. `found` means the whole post: for a post split into parts, a found first
+ *  part with the post not yet recorded complete is `partial` (later parts may still be missing). */
 export async function deliveryLanding(opts: SubsystemSlackDeliveryOpts, decision: OutboundDecision):
-  Promise<"unattempted" | "found" | "maybe" | "absent" | { unreadable: string }> {
+  Promise<"unattempted" | "found" | "partial" | "maybe" | "absent" | { unreadable: string }> {
   if (opts.delivered.load().has(decision.decisionId)) return "found";
   const attempted = opts.attempted.load();
   const multipart = `${decision.decisionId}:part:1`;
   const firstId = attempted.has(decision.decisionId) ? decision.decisionId : attempted.has(multipart) ? multipart : null;
   if (!firstId) return "unattempted";
-  return firstMessageMayHaveLanded(opts, (decision.payload ?? {}) as DeliveryPart, decision.decisionId, firstId);
+  const first = await firstMessageMayHaveLanded(opts, (decision.payload ?? {}) as DeliveryPart, decision.decisionId, firstId);
+  return first === "found" && firstId === multipart ? "partial" : first;
 }
 
 export type SubsystemSlackDeliverFn = SubsystemDeliverFn & { landing: (decision: OutboundDecision) => ReturnType<typeof deliveryLanding> };
