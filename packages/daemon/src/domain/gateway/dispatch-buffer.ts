@@ -69,4 +69,13 @@ export class DispatchBuffer {
   pending(): OutboundDecision[] {
     return readState(this.path).pending;
   }
+
+  /** The same list for a caller that must tell "none" from "can't tell": empty when the file doesn't exist, and a throw
+   *  when it exists but can't be read or parsed (where `pending()` fails to empty). */
+  pendingStrict(): OutboundDecision[] {
+    if (!existsSync(this.path)) return [];
+    const raw = JSON.parse(readFileSync(this.path, "utf8")) as Partial<BufferState>;
+    if (!Array.isArray(raw.pending)) throw new Error(`dispatch buffer ${this.path} has no pending list`);
+    return raw.pending;
+  }
 }

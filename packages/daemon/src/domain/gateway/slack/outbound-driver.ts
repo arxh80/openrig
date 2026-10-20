@@ -141,7 +141,7 @@ export class SlackOutboundDriver {
    *  be read counts as pending: waiting for the restart reseed is better than a duplicate post. */
   private pendingInBuffer(key: string): boolean {
     try {
-      return new DispatchBuffer(this.deps.home).pending().some((d) => {
+      return new DispatchBuffer(this.deps.home).pendingStrict().some((d) => {
         const payload = d.payload as OutboundPostPayload | undefined;
         return (payload?.notificationKey ?? payload?.qitemId) === key;
       });

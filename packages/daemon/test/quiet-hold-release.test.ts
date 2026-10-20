@@ -3,7 +3,7 @@
 // each still-eligible ask individually through the ordinary Slack path. Real SQLite (all migrations), the real queue,
 // the real gateway wire over a recording fetch, and the real watchdog jobs table. No Slack. Native: NOT RUN.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
@@ -16,7 +16,7 @@ import { makeQueuePorts } from "../src/domain/gateway/slack/queue-access.js";
 import { DEFAULT_CONFIG, saveConfig } from "../src/domain/gateway/slack/config.js";
 import { buildSlackGatewayWire } from "../src/domain/gateway/slack/slack-subsystem.js";
 import { OUTBOUND_OP, toPayload } from "../src/domain/gateway/slack/outbound-driver.js";
-import { DispatchBuffer } from "../src/domain/gateway/dispatch-buffer.js";
+import { DispatchBuffer, dispatchBufferPath } from "../src/domain/gateway/dispatch-buffer.js";
 import { SlackOutboundDriver } from "../src/domain/gateway/slack/outbound-driver.js";
 import { SeenStore } from "../src/domain/gateway/slack/state-store.js";
 import { resolveSlackHandle } from "../src/domain/gateway/human-registry.js";
@@ -569,6 +569,29 @@ describe("after review: the outbound sweep when a dispatch throws", () => {
     const second = await driver.sweepOnce();
     expect(calls).toEqual(["q-1"]); // q-1 offered again; q-2 is in flight
     expect(second.dispatched).toEqual(["q-1"]);
+  });
+
+  it.each(["unreadable", "corrupt"])("a dispatch that throws while the buffer is %s stays in flight: can't tell is never 'nothing pending'", async (state) => {
+    const buffer = new DispatchBuffer(home);
+    buffer.enqueue({ kind: "outbound_decision", decisionId: "d-before", op: OUTBOUND_OP, entityBindingRef: "person@external", payload: alerts[0] });
+    const path = dispatchBufferPath(home);
+    const before = readFileSync(path, "utf8");
+    let calls = 0;
+    const driver = new SlackOutboundDriver({
+      home, queue: { listHumanAlerts: async () => [alerts[0]] } as never, seen: new SeenStore(join(home, "seen.jsonl")), filter: { minimumLevel: "NOTICE" } as never,
+      dispatch: () => { calls++; throw new Error("transport state unavailable (test)"); }, log: () => {},
+    });
+    if (state === "unreadable") chmodSync(path, 0o000); else writeFileSync(path, "{ not json");
+    try {
+      const first = await driver.sweepOnce();
+      const second = await driver.sweepOnce();
+      expect(first.refused).toHaveLength(1);
+      expect(second.fresh, "the key stays in flight rather than risk a second decision").toBe(0);
+      expect(calls).toBe(1);
+    } finally {
+      if (state === "unreadable") chmodSync(path, 0o600); else writeFileSync(path, before);
+    }
+    expect(buffer.pending().map((d) => d.decisionId)).toEqual(["d-before"]);
   });
 
   it("a dispatch that throws after its decision was persisted stays in flight: replay owns it, and no second decision is made", async () => {
