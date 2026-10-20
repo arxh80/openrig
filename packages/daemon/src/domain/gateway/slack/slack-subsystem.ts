@@ -57,6 +57,8 @@ import {
   type DeliveryDecision,
 } from "../delivery-rules-engine.js";
 import { armDeliveryDeferral } from "../../policies/delivery-deferral.js";
+import { holdForQuiet } from "../../policies/quiet-release.js";
+import { quietHoldFor } from "../human-quiet-windows.js";
 import { WatchdogJobsRepository } from "../../watchdog-jobs-repository.js";
 
 const SECRET_BOT = "SLACK_BOT_TOKEN";
@@ -307,6 +309,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
         minimumLevelThatPosts: cfg.minimumLevelThatPosts,
         minimumLevelThatInterrupts: cfg.minimumLevelThatInterrupts,
       },
+      quiet: quietHoldFor(opts.queueRepo.db, human.entityId, new Date()),
     });
   };
   const outboundSeen = new SeenStore(path.join(stateDir(opts.home), "slack-outbound-seen.jsonl"));
@@ -515,6 +518,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
           // OPR.0.5.6.1: the engine's decided loudness is the mention rule for
           // registered humans; the dial pair remains only for the null degrade.
           if ((p as { deliveryDigestPost?: boolean }).deliveryDigestPost) return undefined; // notify-class aggregate, never a mention
+          if ((p as { quietRelease?: boolean }).quietRelease) return undefined; // releasing a quiet hold: posted, never a mention
           const fire = (p as { deliveryDeferralFire?: boolean }).deliveryDeferralFire === true;
           const decision = fire ? null : decideForPayload(p);
           const eligible = fire
@@ -675,6 +679,16 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     // A digest post is an already-decided aggregate — never re-consulted
     // (member decisions were recorded at containment; receipts land in onPosted).
     if ((p as { deliveryDigestPost?: boolean }).deliveryDigestPost) return deliver(decision);
+    // Releasing an ask held for quiet hours: the decision was made at message time and the release job re-checked the
+    // ask, so it posts as itself, never re-consulted (that would digest C and D again). A receipt means it already did.
+    if ((p as { quietRelease?: boolean }).quietRelease) {
+      const key = p.notificationKey ?? p.qitemId;
+      if (p.qitemId && opts.queueRepo.transitionLog.hasOwnerNotificationReceipt(p.qitemId, key)) {
+        releaseRef(p.qitemId);
+        return { ok: true as const };
+      }
+      return deliver(decision);
+    }
     if (p.deliveryDeferralFire) {
       const fireKey = p.notificationKey ?? p.qitemId;
       if (p.qitemId && opts.queueRepo.transitionLog.hasOwnerNotificationReceipt(p.qitemId, fireKey)) {
@@ -689,6 +703,19 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       const episodeKey = p.notificationKey ?? p.qitemId;
       if (ruled.outcome === "log") {
         outboundSeen.mark(episodeKey, "log-class-contained");
+        releaseRef(p.qitemId);
+        return { ok: true as const };
+      }
+      if (ruled.outcome === "hold" && ruled.quietHold) {
+        // Quiet hours: recorded on the row with its window, occurrence and revision; the release job posts it later.
+        holdForQuiet({
+          queueRepo: opts.queueRepo,
+          jobsRepo: new WatchdogJobsRepository(opts.queueRepo.db),
+          qitemId: p.qitemId,
+          entityId: (p.destinationSession ?? "").split("@")[0] ?? "unknown",
+          hold: { ...ruled.quietHold, notificationKey: episodeKey },
+        });
+        outboundSeen.mark(episodeKey, "quiet-held");
         releaseRef(p.qitemId);
         return { ok: true as const };
       }

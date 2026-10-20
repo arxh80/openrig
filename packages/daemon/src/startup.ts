@@ -2247,6 +2247,18 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
             return fn(op, ref, payload, opts);
           },
         }),
+        // Quiet hours: one release job per quiet window posts what was held, once quiet is off, through the same gateway.
+        (await import("./domain/policies/quiet-release.js")).makeQuietReleasePolicy({
+          queueRepo: queueRepoInstance,
+          jobsRepo: watchdogJobsRepoInstance,
+          registry: { loadHumanRegistry: (home: string) => loadHumanRegistryForDelivery(home) },
+          home: OPENRIG_HOME,
+          dispatch: (op: string, ref: string, payload: unknown, opts?: { decisionId?: string }) => {
+            const fn = lateGatewayDispatch.fn;
+            if (!fn) return { ok: false, error: "gateway not yet active" };
+            return fn(op, ref, payload, opts);
+          },
+        }),
       ],
     });
     queueRepoInstance.startWaitReminders();

@@ -17,6 +17,9 @@ import type { OwnerNotificationLevel } from "../queue-transition-log.js";
 import { OUTBOUND_OP } from "../gateway/slack/outbound-driver.js";
 import { DispatchBuffer } from "../gateway/dispatch-buffer.js";
 import type { Policy, PolicyJob, PolicyEvaluation } from "./types.js";
+import { quietHoldFor } from "../gateway/human-quiet-windows.js";
+import { WatchdogJobsRepository } from "../watchdog-jobs-repository.js";
+import { holdForQuiet } from "./quiet-release.js";
 
 export const DELIVERY_DIGEST_FLUSH_POLICY = "delivery-digest-flush";
 
@@ -34,6 +37,7 @@ export interface RunDeliveryDigestFlushInput {
   dispatch: (op: string, entityBindingRef: string, payload: unknown, opts?: { decisionId?: string }) => { ok: boolean; error?: string };
   window: "4h" | "daily";
   minimumLevel?: OwnerNotificationLevel;
+  now?: Date;
 }
 
 export async function runDeliveryDigestFlush(input: RunDeliveryDigestFlushInput): Promise<{ dispatched: number; members: number }> {
@@ -69,11 +73,24 @@ export async function runDeliveryDigestFlush(input: RunDeliveryDigestFlushInput)
   const selected = alerts.filter((alert) => {
     const key = alert.notificationKey ?? alert.qitemId;
     if (inFlight.has(key)) return false;
-    return input.queueRepo.listTransitions(alert.qitemId).some((t) =>
-      t.transitionNote?.startsWith("delivery-decision: digest")
-        && t.transitionNote.includes(`notification_key=${key}`)
-        && t.transitionNote.includes(`window=${input.window}`));
+    const notes = input.queueRepo.listTransitions(alert.qitemId).map((t) => t.transitionNote ?? "");
+    // An ask held for quiet hours belongs to its window's release job, which posts it individually.
+    if (notes.some((n) => n.startsWith("delivery-decision: quiet-hold") && n.split(/\s+/).includes(`notification_key=${key}`))) return false;
+    return notes.some((n) =>
+      n.startsWith("delivery-decision: digest")
+        && n.includes(`notification_key=${key}`)
+        && n.includes(`window=${input.window}`));
   });
+  // Quiet hours re-checked at flush time: an ask put in the digest before quiet began is held, not posted, while it's on.
+  const quiet = selected.length ? quietHoldFor(input.queueRepo.db, human.entityId, input.now ?? new Date()) : null;
+  if (quiet) {
+    const jobsRepo = new WatchdogJobsRepository(input.queueRepo.db);
+    for (const item of selected) {
+      holdForQuiet({ queueRepo: input.queueRepo, jobsRepo, qitemId: item.qitemId, entityId: human.entityId,
+        hold: { ...quiet, notificationKey: item.notificationKey ?? item.qitemId } });
+    }
+    return { dispatched: 0, members: 0 };
+  }
   if (selected.length === 0) return { dispatched: 0, members: 0 };
   // The selected timing remains the existing digest policy. At that time a
   // human request/update needs its OWN complete brief and reply identity, not a

@@ -11,6 +11,7 @@ import type { DispatchResult } from "./dispatcher.js";
 import type { LoadResult } from "./human-registry.js";
 import { loadHumanRegistry } from "./human-registry.js";
 import { loadConfig } from "./slack/config.js";
+import { quietHoldFor } from "./human-quiet-windows.js";
 import { OUTBOUND_OP } from "./slack/outbound-driver.js";
 import {
   decideDelivery,
@@ -97,6 +98,8 @@ export function makeOperatorDeliveryEngine(deps: {
           minimumLevelThatPosts: cfg.minimumLevelThatPosts,
           minimumLevelThatInterrupts: cfg.minimumLevelThatInterrupts,
         },
+        // Read for one engine input; an escalation is never held, so quiet doesn't change this rung's decision.
+        quiet: quietHoldFor(deps.queueRepo.db, human.entityId, new Date()),
       });
 
       const payload = {

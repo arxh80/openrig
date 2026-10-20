@@ -131,7 +131,7 @@ export class SlackOutboundDriver {
   }
 }
 
-function toPayload(q: QueueItem): OutboundPostPayload {
+export function toPayload(q: QueueItem): OutboundPostPayload {
   return {
     qitemId: q.qitemId,
     notificationKey: q.notificationKey,

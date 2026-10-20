@@ -244,3 +244,14 @@ export function parseDailyRule(value: string): { start: string; end: string } {
   if (!m) throw new QuietWindowError("invalid_time", `"${value}" isn't a daily window: use HH:MM-HH:MM, for example 22:00-07:00`);
   return { start: m[1]!, end: m[2]! };
 }
+
+/** The person's quiet window when it's on now, as the delivery decision takes it; null when it's off. A database
+ *  without the quiet-hours table (an older test schema) reads as off, which is today's behaviour. */
+export function quietHoldFor(db: Database.Database, entityId: string, now: Date): { windowId: string; occurrence: string; revision: number } | null {
+  try {
+    const state = new HumanQuietStore(db).quietStateFor(entityId, now);
+    return state.active ? { windowId: state.windowId, occurrence: state.occurrence, revision: state.revision } : null;
+  } catch {
+    return null;
+  }
+}

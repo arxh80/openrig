@@ -41,6 +41,8 @@ export const PHASE_D_POLICIES = [
   // additionalPolicies like parked-owner-consumer.
   "delivery-deferral",
   "delivery-digest-flush",
+  // Quiet hours: one release job per quiet window, posting what was held once quiet is off.
+  "quiet-release",
 ] as const;
 
 /** @deprecated since Phase D — use PHASE_D_POLICIES. */
