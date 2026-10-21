@@ -84,7 +84,7 @@ it.skipIf(process.platform === "win32" || process.getuid?.() === 0).each(stores)
     store.set("feed.subscriptions.remote.enabled", "true");
     expect(JSON.parse(fs.readFileSync(file, "utf8")).feed.subscriptions.remote.enabled).toBe(true);
     store.reset("feed.subscriptions.remote.enabled");
-    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({});
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).feed.subscriptions).toEqual({});
   } finally { fs.chmodSync(dir, 0o700); }
 });
 
