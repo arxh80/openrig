@@ -80,11 +80,11 @@ it.skipIf(process.platform === "win32" || process.getuid?.() === 0).each(stores)
     store.set("transcripts.lines", "20");
     expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({ transcripts: { lines: 20 } });
     store.reset("transcripts.lines");
-    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({ transcripts: {} });
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({});
     store.set("feed.subscriptions.remote.enabled", "true");
     expect(JSON.parse(fs.readFileSync(file, "utf8")).feed.subscriptions.remote.enabled).toBe(true);
     store.reset("feed.subscriptions.remote.enabled");
-    expect(JSON.parse(fs.readFileSync(file, "utf8")).feed.subscriptions).toEqual({});
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({});
   } finally { fs.chmodSync(dir, 0o700); }
 });
 
